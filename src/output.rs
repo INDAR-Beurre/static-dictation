@@ -73,7 +73,7 @@ pub fn speak(text: &str) {
 
 /// Newlines would be typed as Enter keypresses (submitting chat forms mid-dictation); flatten to spaces.
 fn flatten_newlines(text: &str) -> String {
-    text.replace('\r', " ").replace('\n', " ")
+    text.replace(['\r', '\n'], " ")
 }
 
 /// Guard against E2BIG: keep the typed arg under the OS per-arg limit.

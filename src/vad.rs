@@ -54,7 +54,7 @@ impl Vad {
             // seed the floor with the first frame; min floor keeps later multiplications sane.
             // Cap the seed: a loud startup click here would pin the floor high and every real
             // frame below 8x of it reads as silence until slow adaptation drags it down (~8s).
-            self.noise_floor = energy.max(1e-7).min(FLOOR_SEED_CAP);
+            self.noise_floor = energy.clamp(1e-7, FLOOR_SEED_CAP);
             self.initialized = true;
         }
 

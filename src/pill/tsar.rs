@@ -6,18 +6,20 @@
 //! Contract (FROZEN):
 //! - `spawn_render_thread(params, tx, rx) -> anyhow::Result<()>` — spawns the render
 //!   thread, binds Wayland, creates an overlay layer surface (top-center, anchored
-//!   TOP only, margin ~48 px, size 320x64, keyboard interactivity None), and drives the
+//!   TOP only, margin ~48 px, size SURF_W x SURF_H from canvas.rs, keyboard
+//!   interactivity None), and drives the
 //!   animation at compositor frame cadence. `rx` receives `Ctl` (the same enum defined
 //!   in pill.rs — reference as `crate::pill::Ctl`). `tx` clone is handed in so the
 //!   thread can detect client hangup (all senders dropped). Return Ok once the thread
 //!   is started and Wayland bound OK; Err if Wayland is unavailable (pill.rs then
 //!   makes the whole tool run headless gracefully).
 //! - The thread: drains `rx` (non-blocking at frame cadence), updates vecmentor `Sim`
-//!   via `Sim::push(level, speaking)` each frame + canvas::render_pill rasterizes.
-//! - `Ctl::Show` → map the surface (draw frame loop until Hide); `Ctl::Hide` → unmap
-//!   (attach transparent/zero buffer  then commit? NO — use `wl_surface.attach(None)`
-//!   via `surface.attach(None::<&wl_buffer>)` then commit, or simply destroy + re-create
-//!   on next Show; pick the simple/safe option). `Ctl::Update{level,speaking}` → advance sim.
+//!   via `Sim::push(level, &bands, speaking)` each frame + canvas::render_pill rasterizes.
+//! - `Ctl::Show` → map the surface (fade in, draw frame loop until Hide); `Ctl::Hide`
+//!   → fade out, then unmap (attach transparent/zero buffer  then commit? NO — use
+//!   `wl_surface.attach(None)` via `surface.attach(None::<&wl_buffer>)` then commit,
+//!   or simply destroy + re-create on next Show; pick the simple/safe option).
+//!   `Ctl::Update{level,bands,speaking}` → advance sim.
 //! - Use `SlotPool` (smithay_client_toolkit::shm::slot::SlotPool) for buffers; ARGB8888;
 //!   damage full surface each frame; use frame callbacks for cadence (request next
 //!   frame only while visible; use `std::thread::sleep` ~33ms fallback if no frame
@@ -86,18 +88,40 @@ use wayland_client::protocol::{wl_buffer, wl_output, wl_shm, wl_surface};
 use wayland_client::{Connection, EventQueue, QueueHandle};
 use wayland_client::backend::WaylandError;
 
+use crate::pill::canvas::{SURF_W, SURF_H};
 use crate::pill::vecmentor::{Sim, WaveParams};
 use crate::pill::Ctl;
 
-/// Fixed pill size. Layer-shell sizes are suggestions, but we own the surface and
-/// always draw at this size; the first configure just confirms the mapped size.
-const PILL_W: u32 = 320;
-const PILL_H: u32 = 64;
-
 /// Wait cap for each dispatch round. The channel cannot wake the Wayland socket,
 /// so an unbounded dispatch would stall Hide/exit until the next frame event.
-/// 50 ms keeps Hide latency invisible and idle CPU near zero (one wakeup / 50 ms).
-const TICK: Duration = Duration::from_millis(50);
+/// 16 ms keeps Ctl latency invisible and idle CPU near zero (one wakeup / 16 ms);
+/// it is also the fade-ramp tick (see `step_alpha`).
+const TICK: Duration = Duration::from_millis(16);
+
+/// Total fade duration: ~160 ms from alpha 0↔1 at the 16 ms TICK (10 ticks).
+const FADE_SECS: f32 = 0.16;
+
+/// One tick of the alpha ramp toward `target` (0.0 or 1.0). Pure math, no
+/// Wayland. Fade-in is ease-out (fast start, gentle settle); fade-out is
+/// ease-in (gentle start, quick finish); never crosses the target. A Show
+/// arriving mid-fade-out just reverses the ramp from the current alpha.
+fn step_alpha(cur: f32, target: f32, dt_secs: f32) -> f32 {
+    if dt_secs <= 0.0 || cur == target {
+        return cur;
+    }
+    let cur = cur.clamp(0.0, 1.0);
+    // Both curves advance a linear progress p by dt/FADE_SECS per tick and are
+    // inverted from `cur` so the ramp always finishes in exactly FADE_SECS.
+    if target >= cur {
+        // Fade-in, ease-out: cur = 1 - (1 - p)^2.
+        let p = (1.0 - (1.0 - cur).sqrt() + dt_secs / FADE_SECS).min(1.0);
+        1.0 - (1.0 - p) * (1.0 - p)
+    } else {
+        // Fade-out, ease-in: cur = 1 - p^2.
+        let p = ((1.0 - cur).sqrt() + dt_secs / FADE_SECS).min(1.0);
+        (1.0 - p * p).max(0.0)
+    }
+}
 
 /// Spawn the render thread; see module doc for requirements.
 pub fn spawn_render_thread(
@@ -218,13 +242,16 @@ fn render_thread(
         output.as_ref(),
     );
     layer.set_anchor(Anchor::TOP);
-    layer.set_size(PILL_W, PILL_H);
+    layer.set_size(SURF_W, SURF_H);
     layer.set_margin(48, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
 
     // Pool borrows shm only during construction; then shm moves into the app.
-    let pool = match SlotPool::new((PILL_W * PILL_H * 4 * 4) as usize, &shm) {
+    // Byte headroom = logical w*h*4 bytes × 4: covers a scale-2 buffer (×4 area)
+    // for ARGB8888 in one allocation; draw() re-creates per-frame buffers from
+    // the same pool.
+    let pool = match SlotPool::new((SURF_W * SURF_H * 4 * 4) as usize, &shm) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("static-dictation: pill step slot_pool failed: {e}");
@@ -241,14 +268,18 @@ fn render_thread(
         started: Instant::now(),
         visible: false,
         need_redraw: true, // first Hide commit once configured
-        width: PILL_W,
-        height: PILL_H,
+        width: SURF_W,
+        height: SURF_H,
         configured: false,
         exited: false,
         // True once any real buffer has been committed; unmap is only valid then
         // (Mango never maps a layer surface whose first commit is a null buffer).
         ever_drawn: false,
         scale: 1,
+        // Fade state: start fully transparent; Show ramps toward 1.0.
+        alpha: 0.0,
+        // Unmap only once per hide; cleared on the next Show.
+        unmapped_this_hide: false,
         pool,
     };
 
@@ -283,15 +314,21 @@ fn render_thread(
             break;
         }
 
-        // 3) Redraw when dirty. Hide when never-yet-drawn just skips drawing;
-        // once mapped, hide = unmap (attach None + commit once). Clear the flag
+        // 2b) Advance the fade ramp one tick; sets need_redraw while alpha is
+        // still moving toward its target (so fading-out keeps drawing until
+        // alpha bottoms and the loop unmaps).
+        app.tick_fade();
+
+        // 3) Redraw when dirty or mid-fade. Fade-out keeps drawing each tick
+        // until alpha bottoms, then unmaps (once per hide). Clear the flag
         // BEFORE drawing: draw() may set it again (buffer-create failure) so the
         // loop retries on the next tick.
-        if app.need_redraw {
+        if app.need_redraw || app.alpha != app.fade_target() {
             app.need_redraw = false;
-            if app.visible {
+            if app.visible || app.alpha > 0.0 {
                 app.draw(&qh);
-            } else if app.ever_drawn {
+            } else if app.ever_drawn && !app.unmapped_this_hide {
+                app.unmapped_this_hide = true;
                 app.unmap();
             }
         }
@@ -322,8 +359,10 @@ fn wait_and_dispatch(
         return Ok(());
     };
     // No safe non-blocking poll of the fd exists in std alone, so: sleep the full
-    // timeout, then read + dispatch. Worst-case frame latency is TICK (50 ms) —
-    // ~20 fps, fine for a pill — and idle CPU is one 50 ms sleep per round, ~0%.
+    // timeout, then read + dispatch. Worst-case frame latency is TICK (16 ms) —
+    // effectively frame-driven while mapped — and idle CPU is one 16 ms sleep per
+    // round, near 0%. TICK is also the fade-ramp step, so the tick keeps the
+    // alpha state machine moving even without frame callbacks.
     std::thread::sleep(timeout);
     match guard.read() {
         Ok(_) => {}
@@ -354,23 +393,44 @@ struct PillApp {
     // True once any real buffer has been committed; unmap is only valid then
     // (Mango never maps a layer surface whose first commit is a null buffer).
     ever_drawn: bool,
+    // Current master alpha (0.0..=1.0), eased toward fade_target each tick.
+    alpha: f32,
+    // At most one unmap per hide; cleared on the next Show.
+    unmapped_this_hide: bool,
     pool: SlotPool,
 }
 
 impl PillApp {
+    /// Where the alpha ramp is heading: 1.0 while visible, else 0.0.
+    fn fade_target(&self) -> f32 {
+        if self.visible { 1.0 } else { 0.0 }
+    }
+
+    /// Advance the fade ramp one TICK; called every loop round before drawing.
+    fn tick_fade(&mut self) {
+        let target = self.fade_target();
+        if self.alpha != target {
+            self.alpha = step_alpha(self.alpha, target, TICK.as_secs_f32());
+            self.need_redraw = true;
+        }
+    }
+
     fn handle_ctl(&mut self, ctl: Ctl) {
         match ctl {
             Ctl::Show => {
                 self.visible = true;
+                // A Show mid-fade-out just reverses the ramp from current alpha;
+                // clearing the unmap guard lets the next full hide unmap again.
+                self.unmapped_this_hide = false;
                 self.need_redraw = true;
             }
             Ctl::Hide => {
                 self.visible = false;
                 self.need_redraw = true;
             }
-            Ctl::Update { level, speaking } => {
-                self.sim.push(level, speaking);
-                if self.visible {
+            Ctl::Update { level, bands, speaking } => {
+                self.sim.push(level, &bands, speaking);
+                if self.visible || self.alpha > 0.0 {
                     self.need_redraw = true;
                 }
             }
@@ -417,10 +477,11 @@ impl PillApp {
 
         crate::pill::canvas::render_pill(
             canvas,
-            width as u32 * scale as u32,
-            height as u32 * scale as u32,
+            width * scale as u32,
+            height * scale as u32,
             self.sim.bars(),
             self.started.elapsed().as_secs_f32(),
+            self.alpha,
         );
 
         self.layer
@@ -468,9 +529,11 @@ impl CompositorHandler for PillApp {
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        // Frame-callback cadence: redraw while visible. While hidden we never
-        // request frame callbacks, so this only fires when mapped.
-        if self.visible {
+        // Frame-callback cadence: redraw while mapped (visible or mid-fade-out).
+        // During fade-out these drawn frames keep the cadence until the final
+        // unmap in the main loop; while fully hidden we never request frame
+        // callbacks, so this only fires when mapped.
+        if self.visible || self.alpha > 0.0 {
             self.draw(qh);
         }
     }
@@ -508,8 +571,8 @@ impl LayerShellHandler for PillApp {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        self.width = NonZeroU32::new(configure.new_size.0).map_or(PILL_W, NonZeroU32::get);
-        self.height = NonZeroU32::new(configure.new_size.1).map_or(PILL_H, NonZeroU32::get);
+        self.width = NonZeroU32::new(configure.new_size.0).map_or(SURF_W, NonZeroU32::get);
+        self.height = NonZeroU32::new(configure.new_size.1).map_or(SURF_H, NonZeroU32::get);
         self.configured = true;
         eprintln!(
             "static-dictation: pill configured {}x{} (visible={})",
@@ -574,3 +637,86 @@ impl ProvidesRegistryState for PillApp {
 }
 
 delegate_dispatch2!(PillApp);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TICK_SECS: f32 = TICK.as_secs_f32();
+
+    /// Sum 16 ms steps until the ramp settles; return (steps_taken, final_alpha).
+    fn run_ramp(from: f32, target: f32, max_steps: usize) -> (usize, f32) {
+        let mut cur = from;
+        let mut steps = 0;
+        while cur != target && steps < max_steps {
+            cur = step_alpha(cur, target, TICK_SECS);
+            steps += 1;
+        }
+        (steps, cur)
+    }
+
+    #[test]
+    fn fade_in_reaches_one_in_about_160ms() {
+        let (steps, end) = run_ramp(0.0, 1.0, 100);
+        assert_eq!(end, 1.0, "must land exactly on target");
+        // 160 ms / 16 ms = 10 ticks; allow one tick of slack for float rounding.
+        assert!((10..=11).contains(&steps), "took {steps} ticks");
+    }
+
+    #[test]
+    fn fade_out_reaches_zero_in_about_160ms() {
+        let (steps, end) = run_ramp(1.0, 0.0, 100);
+        assert_eq!(end, 0.0, "must land exactly on target");
+        assert!((10..=11).contains(&steps), "took {steps} ticks");
+    }
+
+    #[test]
+    fn never_overshoots_or_undershoots() {
+        // Fade-in: monotonic non-decreasing, never above 1.0.
+        let mut cur = 0.0f32;
+        for _ in 0..50 {
+            let next = step_alpha(cur, 1.0, TICK_SECS);
+            assert!(next >= cur && next <= 1.0, "in {cur} out {next}");
+            cur = next;
+        }
+        // Fade-out: monotonic non-increasing, never below 0.0.
+        let mut cur = 1.0f32;
+        for _ in 0..50 {
+            let next = step_alpha(cur, 0.0, TICK_SECS);
+            assert!(next <= cur && next >= 0.0, "in {cur} out {next}");
+            cur = next;
+        }
+    }
+
+    #[test]
+    fn reverses_direction_mid_ramp() {
+        // Half-way into fade-in, flip to fade-out: must glide down from the
+        // current value (not jump) and still reach 0.0 in ~the remaining ramp.
+        let mut cur = 0.0f32;
+        for _ in 0..5 {
+            cur = step_alpha(cur, 1.0, TICK_SECS);
+        }
+        assert!(cur > 0.0 && cur < 1.0);
+        let top = cur;
+        let (steps, end) = run_ramp(top, 0.0, 100);
+        assert_eq!(end, 0.0);
+        assert!(steps <= 11, "reverse ramp took {steps} ticks");
+        // And back mid-fade-out to fade-in again.
+        cur = end;
+        for _ in 0..3 {
+            cur = step_alpha(cur, 0.0, TICK_SECS);
+        }
+        let (steps, end) = run_ramp(cur, 1.0, 100);
+        assert_eq!(end, 1.0);
+        assert!(steps <= 11, "second reverse took {steps} ticks");
+    }
+
+    #[test]
+    fn degenerate_inputs_are_stable() {
+        assert_eq!(step_alpha(0.5, 0.5, TICK_SECS), 0.5);
+        assert_eq!(step_alpha(0.4, 1.0, 0.0), 0.4); // dt=0: no movement
+        assert_eq!(step_alpha(0.4, 1.0, -0.016), 0.4); // negative dt: no movement
+        assert_eq!(step_alpha(2.0, 0.0, TICK_SECS) <= 1.0, true);
+        assert_eq!(step_alpha(-0.5, 1.0, TICK_SECS) >= 0.0, true);
+    }
+}

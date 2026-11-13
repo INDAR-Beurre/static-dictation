@@ -1,5 +1,6 @@
 //! static-dictation v1: lightweight push-to-talk / toggle dictation → Groq whisper-large-v3-turbo.
 
+mod bands;
 mod capture;
 mod config;
 mod endpoint;
@@ -75,7 +76,8 @@ fn main() {
                 utterance.extend_from_slice(&frame);
                 if let Some(p) = &pill {
                     let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
-                    p.update(rms, voice);
+                    let bands = bands::energies(&frame);
+                    p.update(rms, &bands, voice);
                 }
                 if ep.push(voice) == Decision::End {
                     finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);

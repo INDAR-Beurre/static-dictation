@@ -3,12 +3,13 @@
 //!
 //! Contract with main.rs / vecmentor / tsar:
 //! - `PillHandle` is the public facade. Cloneable, Send, 'static — pass it anywhere.
-//! - One instance per process. `show()` / `hide()` / `update(rms_level, speaking)` are
-//!   non-blocking, thread-safe, cheap: they only push into an internal channel; the
+//! - One instance per process. `show()` / `hide()` / `update(rms_level, bands, speaking)`
+//!   are non-blocking, thread-safe, cheap: they only push into an internal channel; the
 //!   render thread (this module owns it) does all Wayland + drawing work.
 //! - When the pill is visible, `update()` MUST be called at ~30 Hz with the current
-//!   RMS level (0.0..1.0, can exceed for loud speech — clamp internally) so the
-//!   animation is lively. `speaking` = current VAD voice flag.
+//!   RMS level (0.0..1.0, can exceed for loud speech — clamp internally) and the
+//!   9 per-band spectral energies from `bands::energies` so the animation is lively.
+//!   `speaking` = current VAD voice flag.
 //! - `show()` should be called right when recording starts, `hide()` when it finalizes.
 //! - The animation: symmetric equalizer-style bars (like the reference image),
 //!   teal/cyan color, gentle glow, smooth level smoothing, peak-hold with decay.
@@ -23,9 +24,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-mod vecmentor;
+pub(crate) mod vecmentor;
 mod canvas;
 mod tsar;
+
+#[cfg(test)]
+mod preview;
 
 /// Public handle to the pill. Clone and send freely.
 #[derive(Clone)]
@@ -45,7 +49,7 @@ struct PillInner {
 pub enum Ctl {
     Show,
     Hide,
-    Update { level: f32, speaking: bool },
+    Update { level: f32, bands: [f32; 9], speaking: bool },
 }
 
 impl PillHandle {
@@ -82,15 +86,16 @@ impl PillHandle {
 
     /// Non-blocking animation frame. Call at ~30 Hz while visible.
     /// `level` is 0.0..1.0 RMS, over 1.0 = clipped/loud speech (we clamp).
+    /// `bands` is the 9 per-band spectral energies from `bands::energies`.
     /// Cheap no-op once the render thread is dead.
-    pub fn update(&self, level: f32, speaking: bool) {
+    pub fn update(&self, level: f32, bands: &[f32; 9], speaking: bool) {
         if !self.inner.alive() {
             return;
         }
         let _ = self
             .inner
             .tx
-            .send(Ctl::Update { level: level.clamp(0.0, 2.0), speaking });
+            .send(Ctl::Update { level: level.clamp(0.0, 2.0), bands: *bands, speaking });
     }
 }
 
@@ -109,13 +114,14 @@ mod tests {
         // The facade is thin; verify the channel command flow that
         // show/hide/update rely on, without needing Wayland at all.
         let (tx, rx) = crossbeam_channel::unbounded::<Ctl>();
+        let b = [0.1f32; 9];
         tx.send(Ctl::Show).unwrap();
-        tx.send(Ctl::Update { level: 1.5, speaking: true }).unwrap();
+        tx.send(Ctl::Update { level: 1.5, bands: b, speaking: true }).unwrap();
         tx.send(Ctl::Hide).unwrap();
         assert!(matches!(rx.recv(), Ok(Ctl::Show)));
         assert!(matches!(
             rx.recv(),
-            Ok(Ctl::Update { level: 1.5, speaking: true })
+            Ok(Ctl::Update { level: 1.5, bands: b, speaking: true })
         ));
         assert!(matches!(rx.recv(), Ok(Ctl::Hide)));
     }
@@ -135,7 +141,7 @@ mod tests {
         // Simulate render-thread exit (what tsar's AliveGuard does).
         alive.store(false, Ordering::Release);
         handle.show();
-        handle.update(0.5, true);
+        handle.update(0.5, &[0.0; 9], true);
         handle.hide();
         assert!(rx.try_recv().is_err(), "no Ctl may be sent after death");
     }
@@ -158,8 +164,16 @@ mod live_tests {
         let t0 = Instant::now();
         let mut i = 0u32;
         while t0.elapsed() < Duration::from_secs(3) {
-            let level = 0.5 + 0.5 * (i as f32 / 9.0).sin(); // sweep so bars animate
-            p.update(level, i % 40 < 30);
+            // Level: sine sweep 0.4..1.2.
+            let level = 0.8 + 0.4 * (i as f32 / 7.0).sin();
+            // Bands: one-hot band rotating across the 9 indices, with the
+            // neighbors trailing at half energy so the sweep looks continuous.
+            let hot = ((i / 4) % 9) as usize;
+            let mut bands = [0.0f32; 9];
+            bands[hot] = 1.0;
+            bands[(hot + 8) % 9] = 0.5;
+            bands[(hot + 1) % 9] = 0.5;
+            p.update(level, &bands, i % 4 != 0); // speaking ~75% of frames
             i += 1;
             std::thread::sleep(Duration::from_millis(33));
         }
