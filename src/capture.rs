@@ -123,6 +123,8 @@ impl AudioIn {
     }
 
     /// Take every queued chunk into `buf`, leaving the queue empty.
+    // shortcut: tests use it; main still on the try_recv compat loop — fine as-is
+    #[cfg(test)]
     pub fn drain_into(&self, buf: &mut Vec<f32>) {
         while let Ok(chunk) = self.rx.try_recv() {
             buf.extend_from_slice(&chunk);
