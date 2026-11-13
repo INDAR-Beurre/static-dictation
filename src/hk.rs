@@ -12,11 +12,10 @@ pub enum HotkeyEvent {
     Toggle,
 }
 
-/// key codes
+/// key codes (values from linux/input-event-codes.h, NOT X keycodes: X = kernel + 8)
 const KEY_D: u16 = 32;
-const KEY_KP0_OLD: u16 = 97; // old kernels
-const KEY_KP0: u16 = 98;
-const KEY_RIGHTCTRL: u16 = 304;
+const KEY_KP0: u16 = 82; // numpad 0 with NumLock on; NumLock off sends KEY_INSERT
+const KEY_RIGHTCTRL: u16 = 97;
 const KEY_LEFTMETA: u16 = 125;
 const KEY_RIGHTMETA: u16 = 126;
 
@@ -78,7 +77,7 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
                     state.last_ptt_down = Some(Instant::now());
                     Some(HotkeyEvent::PttDown)
                 }
-                KEY_KP0 | KEY_KP0_OLD if state.past(&state.last_toggle) => {
+                KEY_KP0 if state.past(&state.last_toggle) => {
                     state.last_toggle = Some(Instant::now());
                     Some(HotkeyEvent::Toggle)
                 }
@@ -188,7 +187,7 @@ mod tests {
     fn kp0_toggles() {
         let mut s = state();
         assert_eq!(decide(&mut s, KEY_KP0, 1), Some(HotkeyEvent::Toggle));
-        assert_eq!(decide(&mut s, KEY_KP0_OLD, 1), None); // debounced
+        assert_eq!(decide(&mut s, KEY_KP0, 1), None); // second tap inside debounce window ignored
     }
 
     #[test]

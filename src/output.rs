@@ -1,39 +1,38 @@
-//! output: deliver transcribed text (stdout + clipboard) and spoken feedback.
+//! output: deliver transcribed text (stdout + direct typing) and spoken feedback.
 
-use std::io::Write;
 use std::process::{Command, Stdio};
 
 #[derive(Debug, PartialEq, Eq)]
 enum Choice {
-    WlCopy,
-    Xclip,
+    WlType,
+    Xdotool,
     None,
 }
 
-/// Pure decision for tests: which clipboard path fits this session.
-fn clipboard_target(wayland: bool, x11: bool) -> Choice {
+/// Pure decision for tests: which direct-typing path fits this session.
+fn typing_target(wayland: bool, x11: bool) -> Choice {
     if wayland {
-        Choice::WlCopy
+        Choice::WlType
     } else if x11 {
-        Choice::Xclip
+        Choice::Xdotool
     } else {
         Choice::None
     }
 }
 
-/// clipboard + stdout + spoken "OK done"
+/// type text into the focused window + stdout + spoken "OK done"
 pub fn deliver(text: &str, no_tts: bool) {
     println!("{text}");
 
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let x11 = std::env::var_os("DISPLAY").is_some();
-    let ok = match clipboard_target(wayland, x11) {
-        Choice::WlCopy => copy_to_clipboard("wl-copy", &[], text) || copy_to_clipboard("xclip", &["-selection", "clipboard"], text),
-        Choice::Xclip => copy_to_clipboard("xclip", &["-selection", "clipboard"], text),
+    let ok = match typing_target(wayland, x11) {
+        Choice::WlType => type_text("wtype", &[], text) || type_text("xdotool", &["type", "--", "-delay", "0"], text),
+        Choice::Xdotool => type_text("xdotool", &["type", "--", "-delay", "0"], text),
         Choice::None => false,
     };
     if !ok {
-        eprintln!("static-dictation: clipboard unavailable (no wl-copy/xclip or no display)");
+        eprintln!("static-dictation: typing unavailable (no wtype/xdotool or no display)");
     }
 
     if !no_tts {
@@ -66,27 +65,18 @@ pub fn speak(text: &str) {
     }
 }
 
-/// Send text to a clipboard tool's stdin WITHOUT a trailing newline so paste is clean.
-fn copy_to_clipboard(bin: &str, args: &[&str], text: &str) -> bool {
+/// Type text as if from a keyboard via a typing tool. wtype types raw; xdotool needs `type --`.
+/// shortcut: no per-char pacing on Wayland; some apps reject instant text, revisit if reported
+fn type_text(bin: &str, args: &[&str], text: &str) -> bool {
     match Command::new(bin)
         .args(args)
-        .stdin(Stdio::piped())
+        .arg(text)
+        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
+        .status()
     {
-        Ok(mut child) => match child.stdin.as_mut() {
-            Some(stdin) => {
-                if stdin.write_all(text.as_bytes()).is_err() {
-                    let _ = child.kill();
-                    return false;
-                }
-                // dropping stdin closes it
-                child.stdin.take();
-                child.wait().map(|s| s.success()).unwrap_or(false)
-            }
-            None => false,
-        },
+        Ok(s) => s.success(),
         Err(_) => false,
     }
 }
@@ -96,22 +86,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn wayland_prefers_wl_copy() {
-        assert_eq!(clipboard_target(true, true), Choice::WlCopy);
+    fn wayland_prefers_wtype() {
+        assert_eq!(typing_target(true, true), Choice::WlType);
     }
 
     #[test]
     fn wayland_only() {
-        assert_eq!(clipboard_target(true, false), Choice::WlCopy);
+        assert_eq!(typing_target(true, false), Choice::WlType);
     }
 
     #[test]
-    fn x11_falls_back_to_xclip() {
-        assert_eq!(clipboard_target(false, true), Choice::Xclip);
+    fn x11_falls_back_to_xdotool() {
+        assert_eq!(typing_target(false, true), Choice::Xdotool);
     }
 
     #[test]
     fn no_display_is_none() {
-        assert_eq!(clipboard_target(false, false), Choice::None);
+        assert_eq!(typing_target(false, false), Choice::None);
     }
 }
