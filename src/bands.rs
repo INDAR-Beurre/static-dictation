@@ -145,7 +145,12 @@ mod tests {
             assert!(!v.is_nan());
             assert!(*v >= 0.0 && *v <= 1.0);
             if i != 4 {
-                assert!(*v < 0.5, "neighbor band {} should be clearly lower, got {}", i, v);
+                assert!(
+                    *v < 0.5,
+                    "neighbor band {} should be clearly lower, got {}",
+                    i,
+                    v
+                );
             }
         }
     }
@@ -156,7 +161,12 @@ mod tests {
         assert!(out[8] > 0.9, "band 8 should be ~1.0, got {}", out[8]);
         for (i, v) in out.iter().enumerate() {
             if i != 8 {
-                assert!(*v < 0.5, "neighbor band {} should be clearly lower, got {}", i, v);
+                assert!(
+                    *v < 0.5,
+                    "neighbor band {} should be clearly lower, got {}",
+                    i,
+                    v
+                );
             }
         }
     }
@@ -175,7 +185,10 @@ mod tests {
     #[test]
     fn quiet_but_audible_passes_very_quiet_gates() {
         let audible = energies(&sine(1000.0, 0.3, N));
-        assert!(audible.iter().any(|&v| v > 0.0), "audible tone must be non-zero");
+        assert!(
+            audible.iter().any(|&v| v > 0.0),
+            "audible tone must be non-zero"
+        );
         let very_quiet = energies(&sine(1000.0, 0.001, N));
         assert_eq!(very_quiet, [0.0; 9], "very quiet tone must gate to zeros");
     }

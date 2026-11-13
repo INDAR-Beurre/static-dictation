@@ -106,7 +106,9 @@ pub fn start() -> Result<AudioIn> {
             }
         }
     });
-    init_rx.recv().context("capture thread died before startup result")??;
+    init_rx
+        .recv()
+        .context("capture thread died before startup result")??;
 
     Ok(AudioIn { rx })
 }

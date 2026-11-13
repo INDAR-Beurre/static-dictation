@@ -23,7 +23,9 @@ const PRE_ROLL: usize = 4800;
 
 fn main() {
     // A closed stdout reader (e.g. piped to `head`) must kill us silently, not panic in println.
-    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 
     let cfg = config::load();
     let pill = pill::PillHandle::try_spawn(); // None = headless, tool works without the pill
@@ -75,7 +77,8 @@ fn main() {
                 }
                 utterance.extend_from_slice(&frame);
                 if let Some(p) = &pill {
-                    let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+                    let rms =
+                        (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
                     let bands = bands::energies(&frame);
                     p.update(rms, &bands, voice);
                 }
@@ -103,7 +106,10 @@ fn main() {
                     audio.drop_backlog();
                 }
                 HotkeyEvent::Toggle => {
-                    eprintln!("static-dictation: toggle event received (recording={} )", recording);
+                    eprintln!(
+                        "static-dictation: toggle event received (recording={} )",
+                        recording
+                    );
                     if recording {
                         recording = false;
                         if let Some(p) = &pill {

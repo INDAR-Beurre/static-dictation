@@ -16,7 +16,13 @@ pub struct Vad {
 
 impl Vad {
     pub fn new() -> Self {
-        Self { noise_floor: 1e-7, initialized: false, x_prev: 0.0, y_prev: 0.0, filter_primed: false }
+        Self {
+            noise_floor: 1e-7,
+            initialized: false,
+            x_prev: 0.0,
+            y_prev: 0.0,
+            filter_primed: false,
+        }
     }
 
     /// Removes constant DC offset so energy/ZCR see the AC content only.
@@ -47,7 +53,10 @@ impl Vad {
         }
         let frame = self.dc_block(frame);
         let energy = frame.iter().map(|s| s * s).sum::<f32>() / len as f32;
-        let zero_count = frame.windows(2).filter(|w| (w[0] < 0.0) != (w[1] < 0.0)).count();
+        let zero_count = frame
+            .windows(2)
+            .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+            .count();
         let zcr = zero_count as f32 / (len - 1) as f32;
 
         if !self.initialized {
@@ -58,8 +67,7 @@ impl Vad {
             self.initialized = true;
         }
 
-        let is_voice =
-            energy > (self.noise_floor * 8.0).max(1e-6) // 8x floor: speech energy sits well above room noise
+        let is_voice = energy > (self.noise_floor * 8.0).max(1e-6) // 8x floor: speech energy sits well above room noise
             && zcr > 0.005 // below ~0.5% crossings it's DC/flat hum, not voiced
             && zcr < 0.30; // above 30% crossings it's hiss/fricative noise, not voiced
 
@@ -130,7 +138,10 @@ mod tests {
         }
 
         let after = v.is_voice(&frame);
-        assert_ne!(before, after, "fixed frame must classify differently after floor adapts");
+        assert_ne!(
+            before, after,
+            "fixed frame must classify differently after floor adapts"
+        );
     }
 
     /// Speech-like signal riding on a 0.5 DC offset: the DC blocker must strip
@@ -145,7 +156,9 @@ mod tests {
         // same DC level + a 200 Hz oscillation the old code mistook for noise
         for _ in 0..10 {
             let frame: Vec<f32> = (0..FRAME)
-                .map(|i| 0.5 + 0.4 * (2.0 * std::f32::consts::PI * 200.0 * i as f32 / 16000.0).sin())
+                .map(|i| {
+                    0.5 + 0.4 * (2.0 * std::f32::consts::PI * 200.0 * i as f32 / 16000.0).sin()
+                })
                 .collect();
             assert!(v.is_voice(&frame), "0.5-DC speech frame must pass the gate");
         }
@@ -156,7 +169,7 @@ mod tests {
     fn startup_pop_does_not_seed_absurd_floor() {
         let mut v = Vad::new();
         v.is_voice(&sine(0.9, 200.0)); // loud pop seeds the floor
-        // normal speech afterwards must be detected immediately, not after ~8s of adaptation
+                                       // normal speech afterwards must be detected immediately, not after ~8s of adaptation
         assert!(v.is_voice(&sine(0.2, 200.0)));
     }
 }

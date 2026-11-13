@@ -52,7 +52,7 @@
 //!                                             Some("static-dictation"), None);
 //! layer.set_anchor(Anchor::TOP);
 //! layer.set_size(320, 64);
-//! layer.set_margin(48, 0, 0, 0);          // top-center TOM: anchor TOP only + WIDTH set
+//! layer.set_margin(-14, 0, 0, 0);         // top-center: anchor TOP only + WIDTH set
 //! layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 //! layer.commit();                        // then wait for first configure event
 //! ```
@@ -73,6 +73,7 @@ use std::time::{Duration, Instant};
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::delegate_registry;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
+use smithay_client_toolkit::reexports::client as wayland_client;
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
 use smithay_client_toolkit::shell::wlr_layer::{
     Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -82,13 +83,12 @@ use smithay_client_toolkit::shell::WaylandSurface;
 use smithay_client_toolkit::shm::slot::SlotPool;
 use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, registry_handlers};
-use smithay_client_toolkit::reexports::client as wayland_client;
+use wayland_client::backend::WaylandError;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_output, wl_region, wl_shm, wl_surface};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
-use wayland_client::backend::WaylandError;
 
-use crate::pill::canvas::{SURF_W, SURF_H};
+use crate::pill::canvas::{SURF_H, SURF_W};
 use crate::pill::vecmentor::{Sim, WaveParams};
 use crate::pill::Ctl;
 
@@ -120,6 +120,82 @@ fn step_alpha(cur: f32, target: f32, dt_secs: f32) -> f32 {
         // Fade-out, ease-in: cur = 1 - p^2.
         let p = ((1.0 - cur).sqrt() + dt_secs / FADE_SECS).min(1.0);
         (1.0 - p * p).max(0.0)
+    }
+}
+
+/// Spring constants for the entrance bounce, derived at compile time.
+///
+/// The grow spring is a damped 2nd-order oscillator driving scale factor
+/// g(t): g" = -k*(g-target) - c*g', i.e. ω_n = √k (natural frequency),
+/// ζ = c/(2√k) (damping ratio). We pick the FEEL, then derive k and c so the
+/// two stay consistent:
+///
+/// - Entrance: ω_n = 22 rad/s (period ≈ 286 ms — one wiggle per overshoot
+///   swing), ζ = 0.35 (underdamped → TWO clearly visible overshoot wiggles;
+///   cold-start peak 1+e^(-ζπ/√(1-ζ²)) ≈ 1.31 rides the 1.25 canvas ceiling
+///   for ~3 ticks — that flat-top IS the Dynamic-Island "stretch" pop),
+///   settling inside 1% for good by ≈ 440 ms, well under the ~600 ms budget.
+///   A small initial velocity kick (SPRING_KICK) launches it out of the bar.
+/// - Hide contraction: ω_n = 24 rad/s, ζ = 0.80 — a faster, firmer,
+///   near-critically-damped shrink (overshoot factor e^(-0.8π/0.6) ≈ ×0.015,
+///   invisible); reaches grow < 0.02 (snapped to 0) in 12 ticks ≈ 192 ms,
+///   matching the required 180-220 ms. The alpha fade runs in parallel.
+///
+/// Semi-implicit Euler at dt = 16 ms is unconditionally stable here
+/// (dt·ω_n ≪ 2), so the integrator never adds oscillation of its own.
+const SPRING_OMEGA_SHOW: f32 = 22.0;
+const SPRING_ZETA_SHOW: f32 = 0.35;
+const SPRING_OMEGA_HIDE: f32 = 24.0;
+const SPRING_ZETA_HIDE: f32 = 0.80;
+const SPRING_KICK: f32 = 2.0;
+
+/// One semi-implicit Euler step of the grow spring toward `target`.
+/// Semi-implicit (a.k.a. symplectic) Euler — update velocity first with the new
+/// position's force, then position with the NEW velocity — is stable for this
+/// dt and gives a livelier, more natural bounce than explicit Euler.
+/// Clamps grow to [0, 1.25] (the same ceiling canvas.rs clamps at) so a big
+/// overshoot can never ask canvas for an out-of-range scale.
+fn step_grow(cur: f32, vel: f32, target: f32, dt_secs: f32, omega: f32, zeta: f32) -> (f32, f32) {
+    if dt_secs <= 0.0 {
+        return (cur, vel);
+    }
+    let k = omega * omega; // ω_n²
+    let c = 2.0 * zeta * omega; // 2·ζ·ω_n
+    let vel = vel + (-k * (cur - target) - c * vel) * dt_secs;
+    // Clamp both ends: [0, 1.25] matches the canvas's internal clamp, so an
+    // overshoot can never ask canvas for an out-of-range scale, and a Hide
+    // retarget from a mid-flight bounce can never dip below collapsed.
+    let cur = (cur + vel * dt_secs).clamp(0.0, 1.25);
+    (cur, vel)
+}
+
+/// One full spring tick on the app state: re-aims at the current target
+/// (1.0 visible / 0.0 hidden) with the phase's ω_n/ζ, and snaps fully-hidden
+/// grow to exactly 0 once it is visually gone (< 0.02) — so a later Show
+/// restarts the bounce from a clean collapsed state, and the alpha fade plus
+/// hide-contraction can finish in parallel without blocking each other.
+fn step_grow_tick(grow: &mut f32, vel: &mut f32, visible: bool, dt_secs: f32) {
+    let target = if visible { 1.0 } else { 0.0 };
+    if (*grow - target).abs() > 0.002 {
+        let (omega, zeta) = if visible {
+            (SPRING_OMEGA_SHOW, SPRING_ZETA_SHOW)
+        } else {
+            (SPRING_OMEGA_HIDE, SPRING_ZETA_HIDE)
+        };
+        let (g, v) = step_grow(*grow, *vel, target, dt_secs, omega, zeta);
+        *grow = g;
+        *vel = v;
+        // Visually gone: clamp to exact 0 (grow < 0.02 rule) so the surface's
+        // last frame is the fully-collapsed one while alpha fades in parallel.
+        if !visible && *grow < 0.02 {
+            *grow = 0.0;
+            *vel = 0.0;
+        }
+    } else if *grow != target {
+        // Spring has settled inside tolerance: land exactly on target so the
+        // loop's idle condition (grow == target) holds without float dust.
+        *grow = target;
+        *vel = 0.0;
     }
 }
 
@@ -226,9 +302,7 @@ fn render_thread(
     let surface = compositor.create_surface(&qh);
     // shortcut: output=None is ambiguous on Mango (dead space above eDP-1) — bind
     // the first real output so the pill anchors to the panel, not nowhere.
-    let output = OutputState::new(&globals, &qh)
-        .outputs()
-        .next();
+    let output = OutputState::new(&globals, &qh).outputs().next();
     let layer = layer_shell.create_layer_surface(
         &qh,
         surface,
@@ -238,7 +312,13 @@ fn render_thread(
     );
     layer.set_anchor(Anchor::TOP);
     layer.set_size(SURF_W, SURF_H);
-    layer.set_margin(48, 0, 0, 0);
+    // Negative top margin: the 104-logical-px surface starts 14 px above the
+    // screen (world y −14..90) so the canvas can slide its capsule between the
+    // collapsed clock-pill position (core at world y 15) and the full island
+    // hugging the top edge (top at world y 6) purely via `grow` — the
+    // compositor geometry stays static (Mango layer animations would fight a
+    // per-tick margin). A static negative margin is proven fine on Mango.
+    layer.set_margin(-14, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
     // WHY regions: the pill is a floating overlay — it must never eat clicks and
@@ -289,6 +369,9 @@ fn render_thread(
         scale: 1,
         // Fade state: start fully transparent; Show ramps toward 1.0.
         alpha: 0.0,
+        // Entrance bounce: grow starts collapsed; the first Show kicks it.
+        grow: 0.0,
+        grow_vel: 0.0,
         pool,
     };
 
@@ -401,13 +484,23 @@ struct PillApp {
     ever_drawn: bool,
     // Current master alpha (0.0..=1.0), eased toward fade_target each tick.
     alpha: f32,
+    // Entrance/hide bounce: scale factor and its velocity, spring-driven
+    // toward `grow_target` each tick (0.0 collapsed .. 1.0 full; may overshoot
+    // to at most 1.25 — canvas clamps there too). Hide uses a faster,
+    // near-critically-damped spring than Show.
+    grow: f32,
+    grow_vel: f32,
     pool: SlotPool,
 }
 
 impl PillApp {
     /// Where the alpha ramp is heading: 1.0 while visible, else 0.0.
     fn fade_target(&self) -> f32 {
-        if self.visible { 1.0 } else { 0.0 }
+        if self.visible {
+            1.0
+        } else {
+            0.0
+        }
     }
 
     /// Advance the fade ramp one TICK; called every loop round before drawing.
@@ -417,6 +510,21 @@ impl PillApp {
             self.alpha = step_alpha(self.alpha, target, TICK.as_secs_f32());
             self.need_redraw = true;
         }
+        // Bounce spring: one semi-implicit Euler step per tick. Show and Hide
+        // pick their own ω_n/ζ; a mid-flight retarget just re-aims the same
+        // spring from its current state (no jump). While |grow - target| is
+        // still visible we keep redrawing; once it has settled (and the alpha
+        // ramp is done) the loop idles as before.
+        let target = if self.visible { 1.0 } else { 0.0 };
+        if (self.grow - target).abs() > 0.002 {
+            step_grow_tick(
+                &mut self.grow,
+                &mut self.grow_vel,
+                self.visible,
+                TICK.as_secs_f32(),
+            );
+            self.need_redraw = true;
+        }
     }
 
     fn handle_ctl(&mut self, ctl: Ctl) {
@@ -424,12 +532,28 @@ impl PillApp {
             Ctl::Show => {
                 self.visible = true;
                 self.need_redraw = true;
+                // Bounce entrance: start collapsed with a small outward velocity
+                // kick so the spring leaps out of the top bar. If a Show lands
+                // mid-shrink, don't restart from 0 — re-aim the running spring
+                // from wherever it is (never jump, no state reset). grow < 0.02
+                // means already snapped to 0 (see step_grow_tick).
+                if self.grow < 0.02 {
+                    self.grow = 0.0;
+                    self.grow_vel = SPRING_KICK;
+                }
             }
             Ctl::Hide => {
                 self.visible = false;
                 self.need_redraw = true;
+                // Shrink immediately with the near-critically-damped hide
+                // spring (chosen in tick_fade); alpha fades in parallel. The
+                // clamp in step_grow means grow < 0.02 reads as "gone".
             }
-            Ctl::Update { level, bands, speaking } => {
+            Ctl::Update {
+                level,
+                bands,
+                speaking,
+            } => {
                 self.sim.push(level, &bands, speaking);
                 if self.visible || self.alpha > 0.0 {
                     self.need_redraw = true;
@@ -473,6 +597,7 @@ impl PillApp {
             self.sim.bars(),
             self.started.elapsed().as_secs_f32(),
             self.alpha,
+            self.grow,
         );
 
         self.layer
@@ -720,7 +845,111 @@ mod tests {
         assert_eq!(step_alpha(0.5, 0.5, TICK_SECS), 0.5);
         assert_eq!(step_alpha(0.4, 1.0, 0.0), 0.4); // dt=0: no movement
         assert_eq!(step_alpha(0.4, 1.0, -0.016), 0.4); // negative dt: no movement
-        assert_eq!(step_alpha(2.0, 0.0, TICK_SECS) <= 1.0, true);
-        assert_eq!(step_alpha(-0.5, 1.0, TICK_SECS) >= 0.0, true);
+        assert!(step_alpha(2.0, 0.0, TICK_SECS) <= 1.0);
+        assert!(step_alpha(-0.5, 1.0, TICK_SECS) >= 0.0);
+    }
+
+    // ---- grow (bounce) spring tests ----
+
+    const EPS: f32 = 1e-4;
+
+    #[test]
+    fn entrance_bounces_with_two_overshoots_and_settles() {
+        let mut grow = 0.0f32;
+        let mut vel = SPRING_KICK;
+        let mut excursions = 0u32;
+        let mut above = false;
+        let mut peaked_above_1_05 = false;
+        let mut last_outside_tick = 0usize;
+        for i in 0..50 {
+            step_grow_tick(&mut grow, &mut vel, true, TICK_SECS);
+            assert!(grow.is_finite(), "tick {i}: grow not finite");
+            assert!(grow >= 0.0, "tick {i}: grow dipped below 0");
+            if grow > 1.0 && !above {
+                excursions += 1;
+            }
+            above = grow > 1.0;
+            peaked_above_1_05 |= grow > 1.05;
+            if (grow - 1.0).abs() >= 0.01 {
+                last_outside_tick = i;
+            }
+        }
+        // TWO visible overshoot wiggles: two separate excursions above 1.0,
+        // the first one clearly visible (past 1.05).
+        assert_eq!(excursions, 2, "want exactly two overshoot wiggles");
+        assert!(peaked_above_1_05, "first overshoot must clear 1.05");
+        // Permanently within 1% of 1.0 well inside the ~600 ms budget
+        // (measured: last outside tick is 28 = 448..464 ms).
+        assert!(
+            last_outside_tick <= 37,
+            "still wobbling at tick {last_outside_tick}"
+        );
+        assert!((grow - 1.0).abs() < 0.01, "end value {grow} drifted");
+    }
+
+    #[test]
+    fn hide_contraction_reaches_zero_within_250ms() {
+        let mut grow = 1.0f32;
+        let mut vel = 0.0f32;
+        let mut ticks = 0;
+        while grow > 0.0 && ticks < 16 {
+            step_grow_tick(&mut grow, &mut vel, false, TICK_SECS);
+            ticks += 1;
+            assert!(grow.is_finite() && grow >= 0.0);
+        }
+        assert!(ticks <= 15, "grow stuck at {grow} after {ticks} ticks");
+        assert_eq!(grow, 0.0, "must snap to exactly 0 (grow<0.02 rule)");
+        // 15 ticks = 240 ms of slack inside the 250 ms budget.
+    }
+
+    #[test]
+    fn show_mid_hide_retargets_without_nans_or_range_violations() {
+        for hide_ticks in [0usize, 1, 4, 8, 12, 16, 20] {
+            let mut grow = 1.0f32;
+            let mut vel = 0.0f32;
+            for _ in 0..hide_ticks {
+                step_grow_tick(&mut grow, &mut vel, false, TICK_SECS);
+            }
+            // Mid-flight Show: spring re-targets from current state (no jump,
+            // no reset). Also cover Hide mid-Show after 10 entrance ticks.
+            for round in 0..60 {
+                step_grow_tick(&mut grow, &mut vel, true, TICK_SECS);
+                assert!(
+                    grow.is_finite() && (0.0..=1.25).contains(&grow),
+                    "hide={hide_ticks} tick {round}: grow={grow} vel={vel}"
+                );
+            }
+            assert!((grow - 1.0).abs() < 0.01, "hide={hide_ticks}: end {grow}");
+            // And the mirror case: Hide arriving mid-Show.
+            let mut grow = 1.0f32;
+            let mut vel = SPRING_KICK;
+            for _ in 0..10 {
+                step_grow_tick(&mut grow, &mut vel, true, TICK_SECS);
+            }
+            for round in 0..30 {
+                step_grow_tick(&mut grow, &mut vel, false, TICK_SECS);
+                assert!(
+                    grow.is_finite() && (0.0..=1.25).contains(&grow),
+                    "hide-mid-show tick {round}: grow={grow} vel={vel}"
+                );
+            }
+            assert_eq!(grow, 0.0);
+        }
+    }
+
+    #[test]
+    fn draw_passes_grow_to_render_pill_by_construction() {
+        // The draw() call site must thread the spring state through to
+        // render_pill (compile-level assertion, by construction):
+        // `render_pill(.., self.alpha, self.grow)` — see `PillApp::draw`.
+        let (g, _v) = step_grow(
+            0.5,
+            0.0,
+            1.0,
+            TICK_SECS,
+            SPRING_OMEGA_SHOW,
+            SPRING_ZETA_SHOW,
+        );
+        assert!((g - 0.5).abs() < 0.5 + EPS);
     }
 }

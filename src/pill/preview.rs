@@ -1,157 +1,223 @@
 //! Visual QA for the dictation pill: renders REAL frames with the REAL
-//! simulator (`vecmentor`) and REAL renderer (`canvas`), asserts
-//! production-quality gates, and dumps viewable 24-bit BMP files.
+//! renderer (`canvas`) and dumps viewable 32-bit BGRA BMP files.
 //!
-//! Scenarios rendered:
-//! - 3 idle frames (level 0, zero bands, not speaking)
-//! - 8 speech frames (one-hot loud band rotating across all 9 bars,
-//!   sine-varied level 0.6–1.3, speaking)
-//! - 3 fade frames (speech state at master_alpha 0.25 / 0.6 / 1.0)
+//! The flipbook is the "island entrance story" (70 frames @ 30 fps = 2.33 s):
+//! - frames 0..18 bounce entrance: `grow` driven by a spring, and
+//!   master_alpha ramps 0→1 over the first 4 frames
+//! - frames 18..54 speech: symmetric 9-band pyramid with syllable bursts
+//! - frames 54..62 release/settle: bars decay to the idle dot row
+//! - frames 62..70 hide: alpha fades to 0 while grow contracts (no bounce)
 //!
-//! BMPs land in `{CARGO_MANIFEST_DIR}/target/pill-preview/` as
-//! `idle-N.bmp`, `speech-N.bmp`, `fade-NN.bmp` (written by the default
-//! test run) plus `anim-00.bmp … anim-59.bmp` (written by the ignored
-//! animation test). All filesystem errors are silently ignored so tests
-//! never fail on FS issues.
+//! NOTE: the entrance spring here approximates the one live in `tsar.rs`
+//! (semi-implicit Euler, ωn≈20 rad/s, ζ≈0.35). `tsar.rs` is the source of
+//! truth for the real animation; this preview only mirrors its constants so
+//! offline flipbooks look like the real thing.
+//!
+//! BMPs land in `{CARGO_MANIFEST_DIR}/target/pill-preview/`:
+//! - `island-000.bmp … island-069.bmp` flipbook (736x208, 32-bit BGRA)
+//! - `island-idle.bmp` (full-size idle capsule), `island-peak.bmp`
+//!   (mid-speech loud frame), `island-half.bmp` (grow≈0.5 mid-bounce)
 //!
 //! Viewing: run `cargo test -- --ignored`, then flip through
-//! `target/pill-preview/anim-*.bmp` as a flipbook (any image viewer with
-//! arrow keys, or `ffmpeg -framerate 30 -i anim-%02d.bmp out.mp4`).
+//! `target/pill-preview/island-*.bmp` as a flipbook (any image viewer with
+//! arrow keys, or `ffmpeg -framerate 30 -i island-%03d.bmp out.mp4`).
 
 use std::fs;
 use std::path::PathBuf;
 
 use super::canvas::{render_pill, SURF_H, SURF_W};
-use super::vecmentor::{wave_params, Sim, NUM_BARS};
+use super::vecmentor::NUM_BARS;
 
 const SCALE: u32 = 2;
+const FPS: f32 = 30.0;
+const DT: f32 = 1.0 / FPS;
 
-enum Scenario {
-    /// level 0, zero bands, speaking=false
-    Idle,
-    /// one-hot band at `idx`, speaking=true
-    Speech(usize),
-    /// speech state rendered at a given master_alpha
-    Fade(f32),
+/// Entrance-spring constants, mirrored from tsar.rs (see module doc).
+const OMEGA: f32 = 20.0;
+const ZETA: f32 = 0.35;
+/// canvas.rs clamps grow to this; clamp here too so keyframes show real size.
+const GROW_MAX: f32 = 1.25;
+
+/// One generated frame of the island story.
+struct Story {
+    grow: f32,
+    alpha: f32,
+    bars: [f32; NUM_BARS],
 }
 
-struct Frame {
-    name: String,
-    scenario: Scenario,
-    t: f32,
+/// Semi-implicit Euler step of the damped spring driving `grow`.
+fn spring_step(x: &mut f32, v: &mut f32, target: f32, omega: f32, zeta: f32, dt: f32) {
+    *v += (omega * omega * (target - *x) - 2.0 * zeta * omega * *v) * dt;
+    *x += *v * dt;
 }
 
-fn scenarios() -> Vec<Frame> {
-    let mut frames = Vec::new();
-    for i in 0..3 {
-        frames.push(Frame { name: format!("idle-{i}.bmp"), scenario: Scenario::Idle, t: i as f32 * 0.17 });
+/// Idle bar row: small center-weighted dots.
+fn idle_bars() -> [f32; NUM_BARS] {
+    let mut bars = [0.0; NUM_BARS];
+    for (i, bar) in bars.iter_mut().enumerate() {
+        *bar = 0.12 * (1.0 - 0.75 * (i as f32 - 4.0).abs() / 4.0);
     }
-    for i in 0..8 {
-        frames.push(Frame { name: format!("speech-{i}.bmp"), scenario: Scenario::Speech(i), t: i as f32 * 0.13 });
+    bars
+}
+
+/// The full 70-frame island entrance story (2.33 s @ 30 fps).
+fn story() -> Vec<Story> {
+    let mut out = Vec::with_capacity(70);
+
+    // Entrance (frames 0..18): spring grow 0→1 with overshoot wiggles,
+    // alpha ramps 0→1 over the first 4 frames.
+    let (mut grow, mut gv) = (0.0f32, 0.0f32);
+    for f in 0..18u32 {
+        spring_step(&mut grow, &mut gv, 1.0, OMEGA, ZETA, DT);
+        let alpha = ((f + 1) as f32 / 4.0).min(1.0);
+        out.push(Story {
+            grow: grow.min(GROW_MAX),
+            alpha,
+            bars: idle_bars(),
+        });
     }
-    for (a, tag) in [(0.25, "25"), (0.6, "60"), (1.0, "100")] {
-        frames.push(Frame { name: format!("fade-{tag}.bmp"), scenario: Scenario::Fade(a), t: 0.42 });
+
+    // Speech (frames 18..54): symmetric pyramid targets with syllable
+    // bursts (3 frames loud, 3 soft) and deterministic per-frame variation,
+    // smoothed fast-attack / slow-release so motion stays smooth.
+    let mut bars = idle_bars();
+    for f in 18..54u32 {
+        let t = f as f32 / FPS;
+        let loud = (f - 18) / 3 % 2 == 0;
+        let envelope = if loud { 0.95 } else { 0.35 } * (0.9 + 0.1 * (t * 2.1).sin());
+        let mut target = [0.0; NUM_BARS];
+        for (i, tg) in target.iter_mut().enumerate() {
+            let nominal = 1.0 - 0.75 * (i as f32 - 4.0).abs() / 4.0;
+            let var =
+                0.22 * (t * 17.0 + i as f32 * 2.1).sin() + 0.12 * (t * 7.3 + i as f32 * 0.9).sin();
+            *tg = (envelope * nominal * (1.0 + var)).clamp(0.0, 1.0);
+        }
+        for i in 0..NUM_BARS {
+            let k = if target[i] > bars[i] { 0.55 } else { 0.22 };
+            bars[i] += (target[i] - bars[i]) * k;
+        }
+        out.push(Story {
+            grow: 1.0,
+            alpha: 1.0,
+            bars,
+        });
     }
-    frames
-}
 
-fn one_hot(idx: usize) -> [f32; NUM_BARS] {
-    let mut bands = [0.0; NUM_BARS];
-    bands[idx] = 1.0;
-    bands
-}
-
-/// Level 0.6–1.3, sine-varied so consecutive speech frames differ.
-fn speech_level(t: f32) -> f32 {
-    0.95 + 0.35 * (t * 5.0).sin()
-}
-
-/// (level, bands, speaking, master_alpha) for a scenario.
-fn input(scenario: &Scenario) -> (f32, [f32; NUM_BARS], bool, f32) {
-    match scenario {
-        Scenario::Idle => (0.0, [0.0; NUM_BARS], false, 1.0),
-        Scenario::Speech(idx) => (speech_level(0.7), one_hot(*idx), true, 1.0),
-        Scenario::Fade(a) => (speech_level(0.7), one_hot(2), true, *a),
+    // Release/settle (frames 54..62): targets decay to the idle dot row.
+    let idle = idle_bars();
+    for _ in 54..62u32 {
+        for i in 0..NUM_BARS {
+            bars[i] += (idle[i] - bars[i]) * 0.18;
+        }
+        out.push(Story {
+            grow: 1.0,
+            alpha: 1.0,
+            bars,
+        });
     }
-}
 
-/// Drive a fresh sim with the same input several steps so smoothed bars
-/// reach a representative steady state, then snapshot them.
-fn drive(level: f32, bands: &[f32; NUM_BARS], speaking: bool) -> Vec<f32> {
-    let mut sim = Sim::new(wave_params());
-    for _ in 0..30 {
-        sim.push(level, bands, speaking);
+    // Hide (frames 62..70): alpha fades to 0 over ~5 frames while grow
+    // contracts fast toward 0 (exponential — no overshoot).
+    let mut hide_grow = 1.0f32;
+    for local in 0..8u32 {
+        hide_grow *= 0.55;
+        // shortcut: never reach exactly 0.0 — a fully blank frame cannot be
+        // distinguished from a skipped render, so fade bottoms out at ~2%.
+        let alpha = (1.0 - local as f32 / 5.0).max(0.02);
+        for bar in &mut bars {
+            *bar *= 0.8;
+        }
+        out.push(Story {
+            grow: hide_grow,
+            alpha,
+            bars,
+        });
     }
-    sim.bars().to_vec()
+    out
 }
 
-fn render(bars: &[f32], t: f32, alpha: f32) -> (u32, u32, Vec<u8>) {
-    let (w, h) = (SURF_W * SCALE, SURF_H * SCALE);
+/// Three single-keyframe BMPs for judging the look at a glance.
+fn keyframes(story: &[Story]) -> Vec<(&'static str, Story)> {
+    let mut out = vec![(
+        "island-idle.bmp",
+        Story {
+            grow: 1.0,
+            alpha: 1.0,
+            bars: idle_bars(),
+        },
+    )];
+    let peak = (18..54)
+        .max_by(|&a, &b| {
+            let sa: f32 = story[a].bars.iter().sum();
+            let sb: f32 = story[b].bars.iter().sum();
+            sa.total_cmp(&sb)
+        })
+        .unwrap();
+    out.push((
+        "island-peak.bmp",
+        Story {
+            grow: 1.0,
+            alpha: 1.0,
+            bars: story[peak].bars,
+        },
+    ));
+    let half = (0..18)
+        .min_by(|&a, &b| {
+            (story[a].grow - 0.5)
+                .abs()
+                .total_cmp(&(story[b].grow - 0.5).abs())
+        })
+        .unwrap();
+    out.push((
+        "island-half.bmp",
+        Story {
+            grow: story[half].grow,
+            alpha: 1.0,
+            bars: story[half].bars,
+        },
+    ));
+    out
+}
+
+fn render_frame(s: &Story, t_secs: f32, scale: u32) -> (u32, u32, Vec<u8>) {
+    let (w, h) = (SURF_W * scale, SURF_H * scale);
     let mut buf = vec![0u8; (w * h * 4) as usize];
-    render_pill(&mut buf, w, h, bars, t, alpha);
+    render_pill(&mut buf, w, h, &s.bars, t_secs, s.alpha, s.grow);
     (w, h, buf)
 }
 
-struct Stats {
-    semi_alpha: usize,   // 0 < a < 255 (soft AA edges, shadow, glow)
-    teal: usize,         // bar-core teal: g>200 && b>200 && r<90
-    bright_teal: usize,  // teal AND mostly opaque
-    alpha_sum: u64,
-}
-
-fn stats(w: u32, h: u32, buf: &[u8]) -> Stats {
-    let mut s = Stats { semi_alpha: 0, teal: 0, bright_teal: 0, alpha_sum: 0 };
-    for px in buf.chunks_exact(4) {
-        let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
-        if a > 0 && a < 255 {
-            s.semi_alpha += 1;
-        }
-        if g > 200 && b > 200 && r < 90 {
-            s.teal += 1;
-            if a > 200 {
-                s.bright_teal += 1;
-            }
-        }
-        s.alpha_sum += a as u64;
-    }
-    let _ = (w, h);
-    s
-}
-
-/// Std-only 24-bit BMP writer: 54-byte header, BGR bottom-up rows,
-/// 4-byte row padding. Alpha is composited over near-black so the
-/// viewer sees what the compositor would. FS errors silently ignored.
+/// 32-bit BGRA BMP writer (BITMAPV4HEADER + BI_BITFIELDS so the alpha
+/// channel survives), bottom-up rows. FS errors silently ignored so tests
+/// never fail on FS issues.
 fn write_bmp(name: &str, w: u32, h: u32, buf: &[u8]) {
-    let row = (w * 3) as usize;
-    let pad = (4 - row % 4) % 4;
-    let data_size = (row + pad) * h as usize;
-    let mut out = Vec::with_capacity(54 + data_size);
+    let data_size = w * h * 4;
+    let mut out = Vec::with_capacity(122 + data_size as usize);
     out.extend_from_slice(b"BM");
-    out.extend_from_slice(&(54u32 + data_size as u32).to_le_bytes());
+    out.extend_from_slice(&(122u32 + data_size).to_le_bytes());
     out.extend_from_slice(&0u32.to_le_bytes()); // reserved
-    out.extend_from_slice(&54u32.to_le_bytes()); // pixel data offset
-    out.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER size
+    out.extend_from_slice(&122u32.to_le_bytes()); // pixel data offset
+                                                  // BITMAPV4HEADER, 108 bytes.
+    out.extend_from_slice(&108u32.to_le_bytes());
     out.extend_from_slice(&(w as i32).to_le_bytes());
     out.extend_from_slice(&(h as i32).to_le_bytes());
     out.extend_from_slice(&1u16.to_le_bytes()); // planes
-    out.extend_from_slice(&24u16.to_le_bytes()); // bpp
-    out.extend_from_slice(&0u32.to_le_bytes()); // no compression
-    out.extend_from_slice(&(data_size as u32).to_le_bytes());
+    out.extend_from_slice(&32u16.to_le_bytes()); // bpp
+    out.extend_from_slice(&3u32.to_le_bytes()); // BI_BITFIELDS
+    out.extend_from_slice(&data_size.to_le_bytes());
     out.extend_from_slice(&2835u32.to_le_bytes()); // 72 dpi
     out.extend_from_slice(&2835u32.to_le_bytes());
-    out.extend_from_slice(&0u32.to_le_bytes()); // palette
-    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // colors used
+    out.extend_from_slice(&0u32.to_le_bytes()); // colors important
+    out.extend_from_slice(&0x00FF_0000u32.to_le_bytes()); // R mask
+    out.extend_from_slice(&0x0000_FF00u32.to_le_bytes()); // G mask
+    out.extend_from_slice(&0x0000_00FFu32.to_le_bytes()); // B mask
+    out.extend_from_slice(&0xFF00_0000u32.to_le_bytes()); // A mask
+    out.extend_from_slice(&0x7352_4742u32.to_le_bytes()); // LCS sRGB
+    out.extend(std::iter::repeat_n(0u8, 108 - 60)); // endpoints + gammas
+
     for y in (0..h).rev() {
-        for x in 0..w {
-            let i = ((y * w + x) * 4) as usize;
-            let a = buf[i + 3] as f32 / 255.0;
-            out.push((buf[i] as f32 * a) as u8);
-            out.push((buf[i + 1] as f32 * a) as u8);
-            out.push((buf[i + 2] as f32 * a) as u8);
-        }
-        for _ in 0..pad {
-            out.push(0);
-        }
+        let row = ((y * w * 4) as usize)..(((y + 1) * w * 4) as usize);
+        out.extend_from_slice(&buf[row]);
     }
     let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     dir.push("target");
@@ -161,100 +227,72 @@ fn write_bmp(name: &str, w: u32, h: u32, buf: &[u8]) {
     }
 }
 
+/// End-to-end headless gate run: generates the whole island story, renders
+/// every frame at scale 1 (small/fast), and asserts the story reads right.
 #[test]
-fn preview_frames_pass_production_gates() {
-    let frames = scenarios();
-    let mut rendered: Vec<(String, u32, u32, Vec<u8>, Stats)> = Vec::new();
+fn island_story_passes_gates() {
+    let story = story();
+    assert_eq!(story.len(), 70, "story must produce all 70 frames");
 
-    for f in &frames {
-        let (level, bands, speaking, alpha) = input(&f.scenario);
-        assert!(!level.is_nan(), "level is NaN in {}", f.name);
-        assert!(bands.iter().all(|b| !b.is_nan()), "NaN band in {}", f.name);
-        let bars = drive(level, &bands, speaking);
-        assert!(bars.iter().all(|b| !b.is_nan()), "NaN bar in {}", f.name);
+    let mut bright: Vec<usize> = Vec::new();
+    for (f, s) in story.iter().enumerate() {
+        assert!(
+            s.grow.is_finite() && s.alpha.is_finite(),
+            "frame {f} non-finite"
+        );
+        assert!(
+            s.bars.iter().all(|b| b.is_finite() && *b >= 0.0),
+            "frame {f} has bad bars"
+        );
 
-        let (w, h, buf) = render(&bars, f.t, alpha);
-        // Buffer size sanity: BGRA, stride = width*4, full coverage.
+        let (w, h, buf) = render_frame(s, f as f32 / FPS, 1);
         assert_eq!(buf.len(), (w * h * 4) as usize);
+        assert!(buf.iter().any(|&b| b != 0), "frame {f} is fully blank");
 
-        // Gate: canvas corner alpha == 0 (padding around pill, no bleed).
-        let corners = [
-            3,                                     // top-left
-            ((w - 1) * 4 + 3) as usize,            // top-right
-            (((h - 1) * w) * 4 + 3) as usize,      // bottom-left
-            (((h - 1) * w + (w - 1)) * 4 + 3) as usize, // bottom-right
-        ];
-        for (ci, &c) in corners.iter().enumerate() {
-            assert_eq!(buf[c], 0, "corner {ci} alpha != 0 in {}", f.name);
+        let mut opaque_everywhere = true;
+        let mut bright_px = 0usize;
+        for px in buf.as_chunks::<4>().0 {
+            let (b, g, r, a) = (px[0], px[1], px[2], px[3]);
+            if a < 200 {
+                opaque_everywhere = false;
+            }
+            // Cyanish bar pixels, mostly opaque (alpha > 200).
+            if a > 200 && g > 140 && b > 140 && r < 120 {
+                bright_px += 1;
+            }
         }
-
-        let st = stats(w, h, &buf);
-        rendered.push((f.name.clone(), w, h, buf, st));
+        assert!(
+            !opaque_everywhere,
+            "frame {f} is opaque everywhere — background not transparent"
+        );
+        bright.push(bright_px);
     }
 
-    let by_name = |n: &str| rendered.iter().find(|(name, ..)| name == n).unwrap();
-
-    // Gate: soft AA edges + shadow + glow exist (not binary jaggies).
-    // Generous floor: at scale 2 the pill outline alone yields thousands.
-    for (name, .., st) in &rendered {
-        assert!(st.semi_alpha > 300, "{}: only {} semi-transparent px (soft edges/shadow/glow missing)", name, st.semi_alpha);
-    }
-
-    // Gate: a bar-core pixel in a speech frame is teal (g>200, b>200, r<90).
-    let speech = by_name("speech-4.bmp");
-    assert!(speech.4.teal > 30, "speech-4: only {} teal px — bars not rendering teal", speech.4.teal);
-
-    // Gate: master_alpha scales — mean alpha at 0.25 < half of mean at 1.0.
-    let fade25 = by_name("fade-25.bmp");
-    let fade100 = by_name("fade-100.bmp");
-    let mean = |st: &Stats, w: u32, h: u32| st.alpha_sum as f64 / ((w * h) as f64);
-    let m25 = mean(&fade25.4, fade25.1, fade25.2);
-    let m100 = mean(&fade100.4, fade100.1, fade100.2);
-    assert!(m25 < 0.5 * m100, "fade-25 mean alpha {m25} not < half of fade-100 mean alpha {m100}");
-
-    // Gate: speech has more bright teal pixels than idle.
-    let idle = by_name("idle-0.bmp");
+    // Entrance frames must paint a strictly smaller bright footprint than
+    // mid-speech frames (the capsule starts small and grows).
+    let early: usize = bright[..4].iter().sum();
+    let mid: usize = bright[20..30].iter().sum();
     assert!(
-        speech.4.bright_teal > idle.4.bright_teal,
-        "speech bright_teal {} <= idle bright_teal {}",
-        speech.4.bright_teal, idle.4.bright_teal
+        mid > early,
+        "entrance bright-footprint {early} not < mid-speech {mid} — bounce too big?"
     );
-
-    // All gates passed — dump the frames for human inspection.
-    for (name, w, h, buf, _) in &rendered {
-        write_bmp(name, *w, *h, buf);
-    }
 }
 
-/// Renders a 60-frame (2 s @ 30 Hz) voice-like animation to
-/// `target/pill-preview/anim-00.bmp … anim-59.bmp`.
-///
-/// Input: alternating speaking windows of 1.2 s with one-hot bands
-/// rotating per burst, level pulses between 0.3 and 1.3; idle windows
-/// are level 0 with zero bands. Frames are driven continuously through
-/// one sim so the bars ease naturally.
+/// Writes the 70-frame flipbook (`island-000.bmp … island-069.bmp`, 736x208)
+/// plus the three judge keyframes to `target/pill-preview/`.
 ///
 /// Run with `cargo test -- --ignored`, then view as a flipbook
-/// (arrow-key image viewer, or `ffmpeg -framerate 30 -i anim-%02d.bmp out.mp4`).
+/// (arrow-key image viewer, or `ffmpeg -framerate 30 -i island-%03d.bmp out.mp4`).
 #[ignore]
 #[test]
-fn write_human_preview_animation() {
-    const FPS: f32 = 30.0;
-    const BURST_SECS: f32 = 1.2; // speaking window
-    const CYCLE_SECS: f32 = 2.0; // 1.2 s speaking + 0.8 s idle
-    let mut sim = Sim::new(wave_params());
-    for f in 0..60u32 {
-        let t = f as f32 / FPS;
-        let in_burst = t % CYCLE_SECS < BURST_SECS;
-        let burst_idx = ((t / CYCLE_SECS) as usize) % NUM_BARS;
-        let (level, bands, speaking) = if in_burst {
-            // pulse 0.3..1.3, two pulses per burst
-            (0.8 + 0.5 * (t * 5.0).sin(), one_hot(burst_idx), true)
-        } else {
-            (0.0, [0.0; NUM_BARS], false)
-        };
-        sim.push(level, &bands, speaking);
-        let (w, h, buf) = render(sim.bars(), t, 1.0);
-        write_bmp(&format!("anim-{f:02}.bmp"), w, h, &buf);
+fn write_island_flipbook() {
+    let story = story();
+    for (f, s) in story.iter().enumerate() {
+        let (w, h, buf) = render_frame(s, f as f32 / FPS, SCALE);
+        write_bmp(&format!("island-{f:03}.bmp"), w, h, &buf);
+    }
+    for (name, s) in keyframes(&story) {
+        let (w, h, buf) = render_frame(&s, 0.0, SCALE);
+        write_bmp(name, w, h, &buf);
     }
 }

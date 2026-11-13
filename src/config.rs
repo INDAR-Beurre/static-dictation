@@ -12,7 +12,9 @@ pub struct Config {
 /// env var wins; else key file (one line, whitespace trimmed). The file was
 /// written by request_secret with 0600 perms so the key never shows in ps/history.
 fn read_key() -> Option<String> {
-    let k = std::env::var("GROQ_API_KEY").ok().filter(|s| !s.trim().is_empty());
+    let k = std::env::var("GROQ_API_KEY")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
     if let Some(k) = k {
         return Some(k.trim().to_string());
     }
@@ -28,7 +30,11 @@ fn read_key() -> Option<String> {
         .join("static-dictation/api_key");
     let k = std::fs::read_to_string(path).ok()?;
     let k = k.trim();
-    if k.is_empty() { None } else { Some(k.to_string()) }
+    if k.is_empty() {
+        None
+    } else {
+        Some(k.to_string())
+    }
 }
 
 fn compose_endpoint(base: &str) -> String {

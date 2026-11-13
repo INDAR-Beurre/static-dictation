@@ -24,9 +24,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-pub(crate) mod vecmentor;
 mod canvas;
 mod tsar;
+pub(crate) mod vecmentor;
 
 #[cfg(test)]
 mod preview;
@@ -49,7 +49,11 @@ struct PillInner {
 pub enum Ctl {
     Show,
     Hide,
-    Update { level: f32, bands: [f32; 9], speaking: bool },
+    Update {
+        level: f32,
+        bands: [f32; 9],
+        speaking: bool,
+    },
 }
 
 impl PillHandle {
@@ -60,7 +64,9 @@ impl PillHandle {
         let params = vecmentor::wave_params();
         let alive = Arc::new(AtomicBool::new(true));
         match tsar::spawn_render_thread(params, tx.clone(), rx, alive.clone()) {
-            Ok(()) => Some(Self { inner: Arc::new(PillInner { tx, alive }) }),
+            Ok(()) => Some(Self {
+                inner: Arc::new(PillInner { tx, alive }),
+            }),
             Err(e) => {
                 eprintln!("static-dictation: pill UI unavailable ({e}); running headless");
                 None
@@ -92,10 +98,11 @@ impl PillHandle {
         if !self.inner.alive() {
             return;
         }
-        let _ = self
-            .inner
-            .tx
-            .send(Ctl::Update { level: level.clamp(0.0, 2.0), bands: *bands, speaking });
+        let _ = self.inner.tx.send(Ctl::Update {
+            level: level.clamp(0.0, 2.0),
+            bands: *bands,
+            speaking,
+        });
     }
 }
 
@@ -116,12 +123,20 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<Ctl>();
         let b = [0.1f32; 9];
         tx.send(Ctl::Show).unwrap();
-        tx.send(Ctl::Update { level: 1.5, bands: b, speaking: true }).unwrap();
+        tx.send(Ctl::Update {
+            level: 1.5,
+            bands: b,
+            speaking: true,
+        })
+        .unwrap();
         tx.send(Ctl::Hide).unwrap();
         assert!(matches!(rx.recv(), Ok(Ctl::Show)));
         assert!(matches!(
             rx.recv(),
-            Ok(Ctl::Update { level: 1.5, bands: b, speaking: true })
+            Ok(Ctl::Update {
+                level: 1.5,
+                ..
+            })
         ));
         assert!(matches!(rx.recv(), Ok(Ctl::Hide)));
     }
@@ -133,7 +148,10 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded::<Ctl>();
         let alive = Arc::new(AtomicBool::new(true));
         let handle = PillHandle {
-            inner: Arc::new(PillInner { tx, alive: alive.clone() }),
+            inner: Arc::new(PillInner {
+                tx,
+                alive: alive.clone(),
+            }),
         };
         // Sanity: while alive, a send goes through.
         handle.show();
@@ -173,7 +191,7 @@ mod live_tests {
             bands[hot] = 1.0;
             bands[(hot + 8) % 9] = 0.5;
             bands[(hot + 1) % 9] = 0.5;
-            p.update(level, &bands, i % 4 != 0); // speaking ~75% of frames
+            p.update(level, &bands, !i.is_multiple_of(4)); // speaking ~75% of frames
             i += 1;
             std::thread::sleep(Duration::from_millis(33));
         }

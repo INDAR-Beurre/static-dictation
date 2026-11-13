@@ -7,7 +7,11 @@ pub fn transcribe(api_key: &str, endpoint: &str, samples: &[f32]) -> Result<Stri
     if samples.is_empty() {
         return Err(anyhow!("no audio captured"));
     }
-    let endpoint = if endpoint.is_empty() { DEFAULT_URL } else { endpoint };
+    let endpoint = if endpoint.is_empty() {
+        DEFAULT_URL
+    } else {
+        endpoint
+    };
     let wav = to_wav(samples);
     let client = reqwest::blocking::Client::builder()
         .timeout(std::time::Duration::from_secs(60))

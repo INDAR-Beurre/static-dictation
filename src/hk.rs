@@ -39,8 +39,8 @@ struct InputEvent {
     value: i32,
 }
 const EVENT_SIZE: usize = 24; // two i64s + type/code/value
-// shortcut: assumed fixed 24-byte native-endian input_event; newer time64 kernels use the same sizes
-// type_, code, value live at offsets 16, 18, 20 regardless of the time encoding.
+                              // shortcut: assumed fixed 24-byte native-endian input_event; newer time64 kernels use the same sizes
+                              // type_, code, value live at offsets 16, 18, 20 regardless of the time encoding.
 
 /// Keyboard state shared by ALL device watchers: a grab-and-re-emit chain
 /// (keyd → handy clones → compositor) can deliver Super on one /dev/input node
@@ -196,7 +196,11 @@ fn watch_file(
                     if type_ == EV_KEY {
                         // value: 0=release 1=press 2=autorepeat; decide() ignores repeat
                         if tracked(code) && value != 2 {
-                            eprintln!("hk: {short} {} {}", key_name(code), if value == 1 { "press" } else { "release" });
+                            eprintln!(
+                                "hk: {short} {} {}",
+                                key_name(code),
+                                if value == 1 { "press" } else { "release" }
+                            );
                         }
                         // never hold the state lock across eprintln/send: a closed
                         // stderr panics eprintln and would poison the shared mutex

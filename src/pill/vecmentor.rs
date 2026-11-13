@@ -21,62 +21,80 @@
 //!    center bar = voice core (1 kHz), edges = low freqs. The mirrored pair
 //!    shares the band but gets a small per-bar stiffness jitter so it never
 //!    looks mechanically cloned.
-//! 2. PER-BAR ENVELOPE: fast attack, slow release, peak-hold so syllables
-//!    bloom and settle; broadband level folds in modestly.
-//! 3. SPRING-DAMPER: per-bar underdamped spring toward the target (~10%
-//!    overshoot on a step, settles quickly) — no linear-lerp snapping.
+//! 2. PER-BAR ENVELOPE: fast attack (0.8/push — a louder band closes ~80% of
+//!    the gap in a single push), a short peak-hold (~0.3 s) so syllables pop,
+//!    then a gentle release (~0.33 s time constant) for a graceful settle;
+//!    broadband level folds in modestly.
+//! 3. SPRING-DAMPER: per-bar underdamped spring toward the target — ~10-13%
+//!    overshoot on a step, settled (±1%) within ~10-11 pushes (~350 ms at
+//!    30 Hz). The overshoot IS the bounce; no linear-lerp snapping.
 //! 4. EDGE LAG: bars near the edges react slightly slower; motion spreads
 //!    outward from the center organically.
-//! 5. IDLE: when silent, a slow traveling sine wave + gentle per-bar LFO
-//!    wobble breathe in over ~0.7 s so a silent-but-recording pill stays alive.
-//! 6. SPATIAL ENVELOPE: center full, edges lower.
+//! 5. IDLE: when silent, a slow (~1.2 s period) CENTER-EMPHASIZED breathing
+//!    wave + gentle per-bar LFO wobble (±10%) breathe in over ~0.7 s. The
+//!    traveling wave keeps a raised trough (never fully dark), so the resting
+//!    state reads as a neat centered row of small dots — the Siri shimmer —
+//!    not random noise.
+//! 6. SPATIAL ENVELOPE: the whole per-bar target (band bloom and broadband
+//!    level alike) is scaled by 1 - 0.72·distance from center, so edges sit
+//!    at ~28% of the center bar: a pronounced symmetric pyramid.
 
 /// Number of equalizer bars (symmetric: bar i mirrors bar NUM_BARS-1-i).
 pub const NUM_BARS: usize = 9;
 /// Band centers in Hz that `push`'s `bands` slice corresponds to (documentation).
-pub const BAND_CENTERS_HZ: [f32; NUM_BARS] =
-    [250.0, 350.0, 500.0, 700.0, 1000.0, 1400.0, 2000.0, 2800.0, 4000.0];
+pub const BAND_CENTERS_HZ: [f32; NUM_BARS] = [
+    250.0, 350.0, 500.0, 700.0, 1000.0, 1400.0, 2000.0, 2800.0, 4000.0,
+];
 
 /// Static tuning constants. One struct so tsar (renderer) and tests can see them.
 #[derive(Debug, Clone, Copy)]
 pub struct WaveParams {
-    /// Band-envelope attack coefficient (per push, ~30 Hz). Fast rise so
-    /// syllables bloom.
+    /// Band-envelope attack coefficient (per push, ~30 Hz). 0.8 → syllables
+    /// bloom almost instantly (gap to a louder band closes 80% per push).
     pub attack: f32,
-    /// Band-envelope release coefficient (per push). Slow fall so speech
-    /// settles gracefully.
+    /// Band-envelope release coefficient (per push). 0.08 ≈ 0.33 s time
+    /// constant: slow fall so speech settles gracefully.
     pub release: f32,
-    /// Peak-hold time in pushes (30 Hz → 12 = 0.4 s) before the envelope
-    /// may fall back.
+    /// Peak-hold time in pushes (30 Hz → 9 = 0.3 s) before the envelope may
+    /// fall back. Short hold so each syllable pops.
     pub peak_hold: u32,
     /// How much broadband RMS lifts the whole silhouette:
-    /// level term = level * level_gain * spatial_envelope.
+    /// level term = level * level_gain (the shared spatial envelope is
+    /// applied to the combined target afterwards — see `spatial_falloff`).
     pub level_gain: f32,
-    /// How strongly amplitude falls off from bar center to edge
-    /// (envelope = 1 - falloff * distance). 0.65 → edges sit at ~0.35.
+    /// How strongly amplitude falls off from bar center to edge. The WHOLE
+    /// target (band envelope and level term) is scaled by
+    /// `1 - falloff * distance`; 0.72 → edges sit at ~28% of center, a
+    /// pronounced symmetric pyramid.
     pub spatial_falloff: f32,
-    /// Spring stiffness k (per push, semi-implicit Euler). With damping below
-    /// this gives ~8% overshoot on a step at 30 Hz (complex discrete poles).
+    /// Spring stiffness k (per push, semi-implicit Euler). Tuned with the
+    /// damping below for ~10% overshoot on a step at 30 Hz (complex discrete
+    /// poles; see the math comment in `wave_params`).
     pub spring_k: f32,
-    /// Spring damping c (per push). Underdamped on purpose (c < 2 - 2·√(1-k)).
+    /// Spring damping c (per push). Underdamped on purpose: discrete-map
+    /// underdamping needs c < 2·√k_eff, and stability needs k_eff < c.
     pub spring_c: f32,
-    /// How much edge bars lag the center (attack/stiffness scaled by
+    /// How much edge bars lag the center (stiffness scaled by
     /// 1 - edge_lag * distance).
     pub edge_lag: f32,
     /// Per-bar deterministic stiffness jitter amplitude — breaks the mirrored
     /// pair's mechanical cloning.
     pub pair_jitter: f32,
-    /// Idle traveling-wave amplitude (0..1 bar height).
+    /// Idle traveling-wave amplitude (0..1 bar height). 0.18 → idle crests
+    /// reach ~0.18 at the center; troughs stay at ~0.65 of that: a small,
+    /// always-visible centered dot row.
     pub idle_amp: f32,
     /// Pushes of silence before the idle wave is fully gated in (21 ≈ 0.7 s).
     pub idle_gate_pushes: u32,
-    /// Idle blend strength per push once gated.
+    /// Idle blend strength per push once gated. 0.9 — the target snaps to the
+    /// idle body almost immediately; the spring supplies all the smoothing.
     pub idle_blend: f32,
     /// Phase shift between adjacent bars in the idle traveling wave (rad).
     pub idle_phase_step: f32,
-    /// Idle phase advance per push (rad). 0.21 → ~1 s wave period.
+    /// Idle phase advance per push (rad). 0.175 → wave period 2π/0.175 ≈ 36
+    /// pushes ≈ 1.2 s: slow, subtle breathing.
     pub idle_rate: f32,
-    /// Per-bar LFO wobble amplitude (± fraction, e.g. 0.12 = ±12%).
+    /// Per-bar LFO wobble amplitude (± fraction, e.g. 0.10 = ±10%).
     pub wobble_amp: f32,
     /// Per-bar wobble base rate (rad per push); bar i uses rate + 0.05 * i.
     pub wobble_rate: f32,
@@ -85,25 +103,40 @@ pub struct WaveParams {
 /// All tuning constants in one place, chosen for the production look.
 pub fn wave_params() -> WaveParams {
     WaveParams {
-        attack: 0.7,
-        release: 0.09,
-        peak_hold: 12,
+        attack: 0.8,
+        release: 0.08,
+        peak_hold: 9,
         level_gain: 0.3,
-        spatial_falloff: 0.65,
-        // Discrete poles 0.4±0.37i → ~8% overshoot, settles in ~10 pushes.
-        spring_k: 0.5,
-        spring_c: 0.7,
-        edge_lag: 0.45,
+        spatial_falloff: 0.72,
+        // Underdamped spring, tuned at the center bar where the effective
+        // stiffness is k_eff = spring_k * jitter(4) = 0.445 * 0.755 ≈ 0.336
+        // with c = 0.56. Semi-implicit Euler characteristic polynomial:
+        //   z² - (2-c)·z + (1-c+k_eff) = 0
+        //   |z| = r = √(1-c+k_eff) ≈ 0.881,  θ = acos((2-c)/(2r)) ≈ 0.615 rad
+        // → half-period π/θ ≈ 5 pushes, per-period decay r² ≈ 0.78
+        // ⇒ ~10% overshoot on a step, settled (±1%) within ~11 pushes
+        //   (~370 ms at 30 Hz). Stability needs k_eff < c; the worst bar
+        //   (jitter 1.25, dist 0.25) lands at k_eff ≈ 0.50 < 0.9·c = 0.504,
+        //   so wobble stays a decay, never a growl.
+        spring_k: 0.445,
+        spring_c: 0.56,
+        edge_lag: 0.3,
         pair_jitter: 0.25,
-        idle_amp: 0.14,
+        idle_amp: 0.18,
         idle_gate_pushes: 21,
-        idle_blend: 0.35,
+        idle_blend: 0.9,
         idle_phase_step: 1.1,
-        idle_rate: 0.21,
-        wobble_amp: 0.12,
+        idle_rate: 0.175,
+        wobble_amp: 0.1,
         wobble_rate: 0.4,
     }
 }
+
+/// Idle traveling-wave trough floor: the breathing wave never dips below this
+/// fraction of its crest, so the resting pill reads as a neat centered row of
+/// dots (the canvas layer renders small dim dots at low heights) instead of
+/// going fully dark between breaths.
+const IDLE_TROUGH: f32 = 0.65;
 
 /// Simulation state. Fixed-size arrays: plain-old-data, Copy, no allocation.
 #[derive(Debug, Clone, Copy)]
@@ -143,9 +176,7 @@ impl Sim {
             env: [0.0; NUM_BARS],
             peak: [0.0; NUM_BARS],
             peak_timer: [0; NUM_BARS],
-            wobble_phase: [
-                0.0, 0.9, 1.8, 2.7, 3.6, 4.5, 5.4, 0.45, 1.35,
-            ],
+            wobble_phase: [0.0, 0.9, 1.8, 2.7, 3.6, 4.5, 5.4, 0.45, 1.35],
             idle_phase: 0.0,
             idle_frames: u32::MAX, // start fully "silent": idle wave already gated
         }
@@ -163,7 +194,11 @@ impl Sim {
         let mut band = [0.0f32; NUM_BARS];
         for i in 0..NUM_BARS {
             let b = bands[i];
-            band[i] = if b.is_finite() { b.clamp(0.0, 1.0) } else { 0.0 };
+            band[i] = if b.is_finite() {
+                b.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
         }
         // Belt-and-braces: sanitize carried state too (defensive, cheap).
         for i in 0..NUM_BARS {
@@ -200,7 +235,7 @@ impl Sim {
         let center = (NUM_BARS - 1) as f32 * 0.5;
 
         // 1) Band envelopes (per mirrored band index): fast attack, peak-hold
-        //    ~0.4 s, then slow release. The peak never pins the envelope —
+        //    ~0.3 s, then slow release. The peak never pins the envelope —
         //    hold expires and the envelope glides down to the current band.
         let half = NUM_BARS / 2 + 1; // indices 0..=4 cover all 9 bars mirrored
         for j in 0..half {
@@ -224,17 +259,26 @@ impl Sim {
             let j = core::cmp::min(i, NUM_BARS - 1 - i);
             let band_env = self.env[j];
             // Broadband folds in modestly so loud speech lifts everything.
-            let level_term = level * p.level_gain * spatial;
-            let mut target = band_env.max(level_term).clamp(0.0, 1.0);
+            let level_term = level * p.level_gain;
+            // The spatial envelope scales the WHOLE target (band bloom and
+            // broadband alike), so even flat band input renders the pyramid:
+            // center tallest, edges at 1 - spatial_falloff of center.
+            let mut target = band_env.max(level_term).clamp(0.0, 1.0) * spatial;
 
             // Idle breathing: traveling sine + per-bar LFO wobble, gated in on
-            // silence (wobble belongs to the idle look, not to speech).
+            // silence (wobble belongs to the idle look, not to speech). The
+            // body is center-weighted via `spatial` and keeps a raised trough
+            // (IDLE_TROUGH) so the resting silhouette is a dot row, not gaps.
             if idle_gate > 0.0 {
-                self.wobble_phase[i] =
-                    (self.wobble_phase[i] + p.wobble_rate + 0.05 * i as f32) % core::f32::consts::TAU;
+                self.wobble_phase[i] = (self.wobble_phase[i] + p.wobble_rate + 0.05 * i as f32)
+                    % core::f32::consts::TAU;
                 let wobble = 1.0 + p.wobble_amp * self.wobble_phase[i].sin();
                 let wave = self.idle_phase - j as f32 * p.idle_phase_step;
-                let body = (p.idle_amp * (0.5 + 0.5 * wave.sin()) * wobble).clamp(0.0, 1.0);
+                let body = (p.idle_amp
+                    * (IDLE_TROUGH + (1.0 - IDLE_TROUGH) * wave.sin())
+                    * wobble
+                    * spatial)
+                    .clamp(0.0, 1.0);
                 target += (body - target) * (idle_gate * p.idle_blend);
             }
 
@@ -244,7 +288,8 @@ impl Sim {
             let k = (p.spring_k * (1.0 - p.edge_lag * dist) * jitter).max(0.05);
             let c = p.spring_c;
 
-            // Underdamped spring, semi-implicit Euler (stable at k+c < 2).
+            // Underdamped spring, semi-implicit Euler (stable while k < c;
+            // pole math documented at `wave_params`).
             self.vel[i] += k * (target - self.bars[i]) - c * self.vel[i];
             self.vel[i] = self.vel[i].clamp(-0.5, 0.5);
             self.bars[i] = (self.bars[i] + self.vel[i]).clamp(0.0, 1.0);
@@ -307,33 +352,72 @@ mod tests {
         let bars = sim.bars();
         for i in 0..NUM_BARS / 2 {
             let d = (bars[i] - bars[NUM_BARS - 1 - i]).abs();
-            assert!(d < 0.15, "pair {i}/{} too far apart: {bars:?}", NUM_BARS - 1 - i);
+            assert!(
+                d < 0.15,
+                "pair {i}/{} too far apart: {bars:?}",
+                NUM_BARS - 1 - i
+            );
         }
     }
 
     #[test]
     fn step_overshoots_once_then_settles() {
-        let mut sim = Sim::new(wave_params());
-        let mut bands = [0.0f32; NUM_BARS];
-        bands[4] = 0.9; // center bar target ≈ 0.9 (level 0 → pure band env)
-        let mut max_seen = 0.0f32;
-        for step in 0..40 {
-            sim.push(0.0, &bands, true);
-            let b = sim.bars()[4];
-            if step > 4 {
-                max_seen = max_seen.max(b);
+        // Full-loop step response (envelope attack + spring) at the center
+        // bar, across target sizes: the bounce must land in the 10..14%
+        // window and settle within ~12 pushes (≈0.4 s at 30 Hz).
+        for target in [0.5f32, 0.7, 0.9] {
+            let mut sim = Sim::new(wave_params());
+            let mut bands = [0.0f32; NUM_BARS];
+            bands[4] = target; // center bar target = band value (level 0)
+            let mut peak = 0.0f32;
+            let mut tail = [0.0f32; 6];
+            for step in 0..40 {
+                sim.push(0.0, &bands, true);
+                let b = sim.bars()[4];
+                peak = peak.max(b);
+                tail[step % 6] = b;
+            }
+            let final_b = tail[39 % 6];
+            let overshoot = peak / final_b - 1.0;
+            assert!(
+                (0.10..=0.14).contains(&overshoot),
+                "target {target}: overshoot {overshoot:.3} outside 10-14%"
+            );
+            // Settled: the last 6 pushes all sit within 1% of the target.
+            for &b in &tail {
+                assert!(
+                    (b - target).abs() < 0.01,
+                    "target {target}: not settled, tail {tail:?}"
+                );
             }
         }
-        let final_bars = sim.bars()[4];
-        // Underdamped spring: pokes above the target once, then settles near it.
+    }
+
+    #[test]
+    fn pyramid_shape_center_dominant_and_symmetric() {
+        let mut sim = Sim::new(wave_params());
+        let bands = [0.5f32; NUM_BARS];
+        for _ in 0..45 {
+            sim.push(0.9, &bands, true);
+        }
+        let bars = sim.bars();
+        let p = wave_params();
+        // Steady state: every bar sits exactly at target = band * spatial, so
+        // the edge/center ratio must match the configured falloff.
+        let expected_edge = (1.0 - p.spatial_falloff) * bars[4];
         assert!(
-            max_seen > 0.92,
-            "expected overshoot above target 0.9, max {max_seen}"
+            (bars[0] - expected_edge).abs() < 0.02,
+            "edge must sit at 1-spatial_falloff of center: {bars:?}"
         );
-        assert!(
-            (final_bars - 0.9).abs() < 0.06,
-            "must settle near target: {final_bars}"
-        );
+        // Monotone rise from edge to center (the pronounced pyramid).
+        for i in 0..4 {
+            assert!(bars[i] < bars[i + 1], "pyramid must rise to center: {bars:?}");
+        }
+        // Mirrored pairs converge to the same target: near-exact symmetry.
+        for i in 0..NUM_BARS / 2 {
+            let d = (bars[i] - bars[NUM_BARS - 1 - i]).abs();
+            assert!(d < 0.03, "pair {i} asymmetry {d}: {bars:?}");
+        }
     }
 
     #[test]
@@ -349,11 +433,50 @@ mod tests {
         }
         let quiet: f32 = sim.bars().iter().sum();
         assert!(quiet < loud * 0.3, "must decay: loud={loud} quiet={quiet}");
-        // Converged idle: small, breathing, well below speech levels.
-        for &b in sim.bars() {
-            assert!(b < 0.3, "idle bar {b} too tall");
+        let bars = sim.bars();
+        // Converged idle: small breathing dots, well below speech levels.
+        for &b in bars {
+            assert!(b < 0.25, "idle bar {b} too tall");
             assert!(b >= 0.0);
         }
+        assert!(
+            bars[4] > bars[0] && bars[4] > bars[8],
+            "idle silhouette must stay center-weighted: {bars:?}"
+        );
+    }
+
+    #[test]
+    fn idle_center_dot_row_breathes() {
+        let mut sim = Sim::new(wave_params());
+        // Fresh state starts pre-gated; watch one full breathing cycle window.
+        let mut min_center = 1.0f32;
+        let mut max_center = 0.0f32;
+        let mut sum_center = 0.0f32;
+        let mut center_dominant = true;
+        for _ in 0..120 {
+            sim.push(0.0, &[0.0; NUM_BARS], false);
+            let bars = sim.bars();
+            let c = bars[4];
+            min_center = min_center.min(c);
+            max_center = max_center.max(c);
+            sum_center += c;
+            center_dominant &= c >= bars[0] && c >= bars[8];
+        }
+        let mean = sum_center / 120.0;
+        // Small centered dot row: never dark, never tall, Siri-shimmer sized.
+        assert!(
+            min_center > 0.03 && max_center < 0.2,
+            "center dot out of dot range: min {min_center:.3} max {max_center:.3}"
+        );
+        assert!(
+            (0.07..=0.18).contains(&mean),
+            "mean idle center {mean:.3} outside dot band"
+        );
+        assert!(
+            max_center - min_center > 0.04,
+            "idle must breathe over time: min {min_center:.3} max {max_center:.3}"
+        );
+        assert!(center_dominant, "idle must stay center-weighted");
     }
 
     #[test]
@@ -375,7 +498,10 @@ mod tests {
         sim.push(-3.0, &[-1.0; NUM_BARS], false);
         sim.push(2.0, &[1.5; NUM_BARS], true);
         for &b in sim.bars() {
-            assert!(b.is_finite() && (0.0..=1.0).contains(&b), "bar {b} after absurd input");
+            assert!(
+                b.is_finite() && (0.0..=1.0).contains(&b),
+                "bar {b} after absurd input"
+            );
         }
         // State must be un-poisoned: normal speech afterwards behaves normally.
         let mut bands = [0.0f32; NUM_BARS];
@@ -383,7 +509,11 @@ mod tests {
         for _ in 0..30 {
             sim.push(1.0, &bands, true);
         }
-        assert!(sim.bars()[4] > 0.5, "state did not recover: {:?}", sim.bars());
+        assert!(
+            sim.bars()[4] > 0.5,
+            "state did not recover: {:?}",
+            sim.bars()
+        );
     }
 
     #[test]

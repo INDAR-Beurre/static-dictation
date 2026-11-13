@@ -32,7 +32,10 @@ pub fn deliver(text: &str, no_tts: bool) {
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let x11 = std::env::var_os("DISPLAY").is_some();
     let ok = match typing_target(wayland, x11) {
-        Choice::WlType => type_text("wtype", &[], &typed) || type_text("xdotool", &["type", "--", "-delay", "0"], &typed),
+        Choice::WlType => {
+            type_text("wtype", &[], &typed)
+                || type_text("xdotool", &["type", "--", "-delay", "0"], &typed)
+        }
         Choice::Xdotool => type_text("xdotool", &["type", "--", "-delay", "0"], &typed),
         Choice::None => false,
     };
