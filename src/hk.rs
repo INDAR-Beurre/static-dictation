@@ -100,6 +100,7 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
 fn watch_file(path: &str, tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Option<std::thread::JoinHandle<()>> {
     let mut file = File::open(path).ok()?;
     let tx = tx.clone();
+    let path = path.to_string(); // owned so it can move into the 'static watcher thread
     Some(std::thread::spawn(move || {
         let mut state = KeyState::new();
         let mut buf = [0u8; EVENT_SIZE];
@@ -118,7 +119,23 @@ fn watch_file(path: &str, tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Option
                         }
                     }
                 }
-                Err(_) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // reopened a device with no data yet; keep polling
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => {
+                    // ENODEV etc. — device gone or not yet created; retry with a fresh open
+                    loop {
+                        std::thread::sleep(Duration::from_millis(500));
+                        match File::open(&path) {
+                            Ok(f) => {
+                                file = f;
+                                break;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                },
             }
         }
     }))
@@ -145,26 +162,42 @@ fn stdin_fallback(tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
 }
 
 /// Blocks the calling thread forever, sending events. evdev if readable, else stdin fallback.
+/// Rescans /dev/input periodically so hot-plugged keyboards (and uinput test devices)
+/// that appear after startup are picked up. Node names get reused after unplug, so track inodes.
 pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
+    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new(); // (dev, ino)
     let mut opened = 0;
-    if let Ok(entries) = std::fs::read_dir("/dev/input") {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with("event") {
+    loop {
+        if let Ok(entries) = std::fs::read_dir("/dev/input") {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if !name.starts_with("event") {
+                    continue;
+                }
                 let path = format!("/dev/input/{}", name);
-                if let Some(_h) = watch_file(&path, &tx) {
+                let fstat = std::fs::metadata(&path).ok();
+                let id = match &fstat {
+                    // shortcut: chardev dev() is unstable-ish; (rdev, ino) from raw stat is stable and unique per node
+                    Some(m) => {
+                        use std::os::unix::fs::MetadataExt;
+                        (m.rdev(), m.ino())
+                    }
+                    None => (0, 0),
+                };
+                if !seen.insert(id) {
+                    continue; // already watched (or unwatchable)
+                }
+                if watch_file(&path, &tx).is_some() {
                     opened += 1;
                 }
             }
         }
-    }
-    if opened == 0 {
-        stdin_fallback(&tx)
-    } else {
-        loop {
-            std::thread::park();
+        if opened == 0 && seen.is_empty() {
+            return stdin_fallback(&tx); // nothing readable at all
         }
+        // shortcut: 2s poll instead of inotify; fine for a tool that idles at 10ms anyway
+        std::thread::sleep(Duration::from_secs(2));
     }
 }
 
