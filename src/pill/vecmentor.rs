@@ -35,9 +35,15 @@
 //!    traveling wave keeps a raised trough (never fully dark), so the resting
 //!    state reads as a neat centered row of small dots — the Siri shimmer —
 //!    not random noise.
-//! 6. SPATIAL ENVELOPE: the whole per-bar target (band bloom and broadband
-//!    level alike) is scaled by 1 - 0.72·distance from center, so edges sit
-//!    at ~28% of the center bar: a pronounced symmetric pyramid.
+//! 6. SPATIAL ENVELOPE: the whole per-bar SPEECH target (band bloom and
+//!    broadband level alike) is scaled by 1 - 0.72·distance from center, then
+//!    by a static 9-bar SHAPE MASK measured from the reference silhouette —
+//!    not a plain pyramid but the asymmetric-looking island read: low
+//!    outer dots, a dip, and a tall 5-bar cluster dominating the center.
+//!    (Symmetry is preserved: bar i's mask value mirrors bar 8-i's; the
+//!    reference's left-right asymmetry is a lighting trick, not physics.)
+//! 7. IDLE UNAFFECTED: the mask gates speech energy only. The resting state
+//!    stays the round-1 traveling-wave dot row (IDLE_TROUGH behavior).
 
 /// Number of equalizer bars (symmetric: bar i mirrors bar NUM_BARS-1-i).
 pub const NUM_BARS: usize = 9;
@@ -63,9 +69,10 @@ pub struct WaveParams {
     /// applied to the combined target afterwards — see `spatial_falloff`).
     pub level_gain: f32,
     /// How strongly amplitude falls off from bar center to edge. The WHOLE
-    /// target (band envelope and level term) is scaled by
-    /// `1 - falloff * distance`; 0.72 → edges sit at ~28% of center, a
-    /// pronounced symmetric pyramid.
+    /// speech target (band envelope and level term) is scaled by
+    /// `1 - falloff * distance`; 0.72 → edges sit at ~28% of center. The
+    /// static `SHAPE_MASK` then bends that pyramid into the island
+    /// silhouette (low dots, dip, dominant center cluster).
     pub spatial_falloff: f32,
     /// Spring stiffness k (per push, semi-implicit Euler). Tuned with the
     /// damping below for ~10% overshoot on a step at 30 Hz (complex discrete
@@ -138,6 +145,22 @@ pub fn wave_params() -> WaveParams {
 /// going fully dark between breaths.
 const IDLE_TROUGH: f32 = 0.65;
 
+/// Static silhouette mask, bars 0..8, exactly mirrored (mask[i] == mask[8-i]).
+/// Interpolated from the measured reference envelope (relative to tallest):
+/// left ramp 5 bars [0.06,0.10,0.13,0.14,0.15], dip zone [0.08-0.21], tall
+/// 5-bar cluster [0.60,0.83,1.00,0.84,0.62], mirrored right fall into dots.
+/// 9-bar mapping: the cluster occupies bars 2-6 (its inner pair averaged to a
+/// single mirrored value: 0.83/0.84 → 0.84, 0.60/0.62 → 0.61 — the reference's
+/// left/right lopsidedness is a lighting trick, not physics); the ramp and dip
+/// zone compress into the outer pair (bar 1/7 sits at the ramp top, inside the
+/// dip range, so the valley into the cluster reads as the reference's dip).
+/// Under speech the spring's outward lag and pair jitter keep the frozen
+/// vector alive. Multiplies the spatial falloff; band energy modulates on top
+/// (mask × physics, not instead of physics). NOTE: silhouette RATIOS, not
+/// absolute heights — bars still scale with `spatial_falloff`.
+pub const SHAPE_MASK: [f32; NUM_BARS] =
+    [0.06, 0.15, 0.61, 0.84, 1.00, 0.84, 0.61, 0.15, 0.06];
+
 /// Simulation state. Fixed-size arrays: plain-old-data, Copy, no allocation.
 #[derive(Debug, Clone, Copy)]
 pub struct Sim {
@@ -159,6 +182,9 @@ pub struct Sim {
     idle_phase: f32,
     /// Pushes since `speaking` was last true; gates the idle wave in.
     idle_frames: u32,
+    /// Decaying speech activity (1 on any voiced push, ~decays in silence);
+    /// gates the shape mask in/out so idle keeps the round-1 dot row.
+    speech_gate: f32,
 }
 
 /// Deterministic per-bar jitter in [-1, 1]: sin over the golden-angle spread.
@@ -179,6 +205,7 @@ impl Sim {
             wobble_phase: [0.0, 0.9, 1.8, 2.7, 3.6, 4.5, 5.4, 0.45, 1.35],
             idle_phase: 0.0,
             idle_frames: u32::MAX, // start fully "silent": idle wave already gated
+            speech_gate: 0.0,
         }
     }
 
@@ -218,6 +245,9 @@ impl Sim {
         if !self.idle_phase.is_finite() {
             self.idle_phase = 0.0;
         }
+        if !self.speech_gate.is_finite() {
+            self.speech_gate = 0.0;
+        }
 
         if speaking {
             self.idle_frames = 0;
@@ -231,6 +261,15 @@ impl Sim {
             (self.idle_frames as f32 / p.idle_gate_pushes as f32).clamp(0.0, 1.0)
         };
         self.idle_phase = (self.idle_phase + p.idle_rate) % core::f32::consts::TAU;
+        // Speech gate: the shape mask applies to voiced energy only. Rises
+        // instantly on a voiced push, fades in silence so the idle handoff
+        // (dot-row look) is never fighting the mask.
+        let speech_gate = if speaking {
+            1.0
+        } else {
+            (self.speech_gate * 0.9).max(0.0)
+        };
+        self.speech_gate = speech_gate;
 
         let center = (NUM_BARS - 1) as f32 * 0.5;
 
@@ -252,6 +291,8 @@ impl Sim {
         }
 
         // 2) Per-bar spring toward target, with edge lag + pair jitter + idle.
+        // (Inherently index-based: mutates vel/bars/wobble_phase per bar.)
+        #[allow(clippy::needless_range_loop)]
         for i in 0..NUM_BARS {
             let dist = ((i as f32 - center) / center).abs().clamp(0.0, 1.0);
             let spatial = 1.0 - p.spatial_falloff * dist;
@@ -260,10 +301,13 @@ impl Sim {
             let band_env = self.env[j];
             // Broadband folds in modestly so loud speech lifts everything.
             let level_term = level * p.level_gain;
-            // The spatial envelope scales the WHOLE target (band bloom and
-            // broadband alike), so even flat band input renders the pyramid:
-            // center tallest, edges at 1 - spatial_falloff of center.
-            let mut target = band_env.max(level_term).clamp(0.0, 1.0) * spatial;
+            // The spatial envelope scales the WHOLE speech target (band
+            // bloom and broadband alike), so even flat input renders the
+            // island silhouette; the static shape mask (mask × physics) bends
+            // it from a plain pyramid into the measured read. Gate it on
+            // speech so the idle state keeps the round-1 dot row.
+            let mask = 1.0 - speech_gate * (1.0 - SHAPE_MASK[i]);
+            let mut target = band_env.max(level_term).clamp(0.0, 1.0) * spatial * mask;
 
             // Idle breathing: traveling sine + per-bar LFO wobble, gated in on
             // silence (wobble belongs to the idle look, not to speech). The
@@ -394,7 +438,7 @@ mod tests {
     }
 
     #[test]
-    fn pyramid_shape_center_dominant_and_symmetric() {
+    fn flat_input_renders_island_silhouette() {
         let mut sim = Sim::new(wave_params());
         let bands = [0.5f32; NUM_BARS];
         for _ in 0..45 {
@@ -402,22 +446,77 @@ mod tests {
         }
         let bars = sim.bars();
         let p = wave_params();
-        // Steady state: every bar sits exactly at target = band * spatial, so
-        // the edge/center ratio must match the configured falloff.
-        let expected_edge = (1.0 - p.spatial_falloff) * bars[4];
-        assert!(
-            (bars[0] - expected_edge).abs() < 0.02,
-            "edge must sit at 1-spatial_falloff of center: {bars:?}"
-        );
-        // Monotone rise from edge to center (the pronounced pyramid).
-        for i in 0..4 {
-            assert!(bars[i] < bars[i + 1], "pyramid must rise to center: {bars:?}");
+        // Steady state: bar i sits at band * spatial * mask (the speech gate
+        // is 1 after the first voiced push). Assert the full 9-value
+        // silhouette against SHAPE_MASK at ±0.02 so drift gets caught.
+        for (i, &m) in SHAPE_MASK.iter().enumerate() {
+            let dist = ((i as f32 - 4.0) / 4.0).abs();
+            let spatial = 1.0 - p.spatial_falloff * dist;
+            let expected = 0.5 * spatial * m;
+            assert!(
+                (bars[i] - expected).abs() < 0.02,
+                "bar {i}: {} vs expected {expected:.4}: {bars:?}",
+                bars[i]
+            );
         }
-        // Mirrored pairs converge to the same target: near-exact symmetry.
+        // Cluster dominant, edge dots low, mirrored symmetry.
+        assert!(
+            bars[4] > bars[2] * 2.0,
+            "center cluster must dominate: {bars:?}"
+        );
+        assert!(
+            bars[0] < 0.05 && bars[8] < 0.05,
+            "edge dots must stay low: {bars:?}"
+        );
         for i in 0..NUM_BARS / 2 {
             let d = (bars[i] - bars[NUM_BARS - 1 - i]).abs();
             assert!(d < 0.03, "pair {i} asymmetry {d}: {bars:?}");
         }
+    }
+
+    #[test]
+    fn mask_ordering_ramp_dip_cluster() {
+        let mut sim = Sim::new(wave_params());
+        let bands = [0.5f32; NUM_BARS];
+        for _ in 0..45 {
+            sim.push(0.9, &bands, true);
+        }
+        let bars = sim.bars();
+        // Ramp rises inward from the outermost dot...
+        assert!(bars[0] < bars[1], "ramp must rise inward: {bars:?}");
+        // ...into the dip: bars 1/7 sit in the reference's [0.08-0.21] dip
+        // zone, a deep valley below the cluster's first bar (the 9-bar
+        // compression of ramp + dip keeps the dip as the cliff into the
+        // cluster; the outermost dot stays smallest, per the reference).
+        assert!(
+            bars[1] < bars[2] * 0.5 && bars[7] < bars[6] * 0.5,
+            "dip must sit well below the cluster edge: {bars:?}"
+        );
+        // Cluster peaks at center; the right side falls back into dots.
+        for &b in bars {
+            assert!(b <= bars[4] + 1e-4, "center must peak: {bars:?}");
+        }
+        assert!(
+            bars[6] < bars[5] && bars[7] < bars[6] && bars[8] < bars[7],
+            "right side must fall into dots: {bars:?}"
+        );
+    }
+
+    #[test]
+    fn pair_jitter_varies_mask_shape_mid_transient() {
+        // The mask sets the steady-state silhouette; pair_jitter must keep
+        // the mirrored pair from filling it in in lockstep (living waveform,
+        // not a frozen vector). Deterministic jitter → deterministic gap.
+        let mut sim = Sim::new(wave_params());
+        let bands = [0.5f32; NUM_BARS];
+        sim.push(0.9, &bands, true);
+        sim.push(0.9, &bands, true);
+        let bars = sim.bars();
+        let d = (bars[2] - bars[6]).abs();
+        assert!(
+            d > 0.002,
+            "mirrored pair must diverge mid-transient (d={d}): {bars:?}"
+        );
     }
 
     #[test]
