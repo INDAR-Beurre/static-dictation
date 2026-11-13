@@ -165,6 +165,10 @@ fn stdin_fallback(tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
 /// Rescans /dev/input periodically so hot-plugged keyboards (and uinput test devices)
 /// that appear after startup are picked up. Node names get reused after unplug, so track inodes.
 pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
+    // e2e escape hatch on hosts where evdev grabs/uinput are blocked
+    if std::env::var_os("STATIC_DICTATION_STDIN_HOTKEYS").is_some() {
+        return stdin_fallback(&tx);
+    }
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new(); // (dev, ino)
     let mut opened = 0;
     loop {
