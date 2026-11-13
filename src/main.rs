@@ -44,7 +44,7 @@ fn main() {
         }
     });
 
-    println!("static-dictation v1 — hold RightCtrl to speak (release to transcribe); NumPad0 or Super+D toggles continuous dictation");
+    println!("static-dictation v1 — hold RightCtrl to speak (release to transcribe); NumPad0 or AltGr+L toggles continuous dictation");
 
     let audio = capture::start().expect("no microphone available");
     let mut vad = vad::Vad::new();

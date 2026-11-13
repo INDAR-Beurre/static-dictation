@@ -1,4 +1,4 @@
-//! Global hotkey listener: evdev (RightCtrl PTT, KP0 toggle, Super+D toggle) with stdin fallback.
+//! Global hotkey listener: evdev (RightCtrl PTT, KP0 toggle, AltGr+L toggle) with stdin fallback.
 
 use anyhow::Result;
 use std::fs::File;
@@ -13,16 +13,15 @@ pub enum HotkeyEvent {
 }
 
 /// key codes (values from linux/input-event-codes.h, NOT X keycodes: X = kernel + 8)
-const KEY_D: u16 = 32;
+const KEY_L: u16 = 38;
 const KEY_KP0: u16 = 82; // numpad 0 with NumLock on; NumLock off sends KEY_INSERT
 const KEY_RIGHTCTRL: u16 = 97;
-const KEY_LEFTMETA: u16 = 125;
-const KEY_RIGHTMETA: u16 = 126;
+const KEY_RIGHTALT: u16 = 100; // AltGr on most layouts
 
 const EV_KEY: u16 = 0x01;
 const DEBOUNCE: Duration = Duration::from_millis(175);
 /// an idle gap this long means a held meta key missed its keyup — stop trusting it
-const META_IDLE_RESET: Duration = Duration::from_secs(2);
+const MODIFIER_IDLE_RESET: Duration = Duration::from_secs(2);
 /// bounded reopen attempts for transient device-read errors before the watcher exits
 const REOPEN_ATTEMPTS: u32 = 5;
 const REOPEN_SLEEP: Duration = Duration::from_millis(500);
@@ -48,18 +47,23 @@ const EVENT_SIZE: usize = 24; // two i64s + type/code/value
 /// and D on another; per-device state would split the combo. Shared also makes
 /// the cross-node debounce swallow handy's duplicated physical presses, and
 /// means a meta keyup seen by ANY watcher clears the hold for everyone.
+/// Keyboard state shared by ALL device watchers: a grab-and-re-emit chain
+/// (keyd → handy clones → compositor) can deliver Super on one /dev/input node
+/// and D on another; per-device state would split the combo. Shared also makes
+/// the cross-node debounce swallow handy's duplicated physical presses, and
+/// means a modifier keyup seen by ANY watcher clears the hold for everyone.
 struct KeyState {
-    meta_held: bool,
+    modifier_held: bool,
     last_ptt_down: Option<Instant>,
     last_ptt_up: Option<Instant>,
     last_toggle: Option<Instant>,
-    last_event: Instant, // any tracked stream activity, for the stale-meta safety
+    last_event: Instant, // any tracked stream activity, for the stale-hold safety
 }
 
 impl KeyState {
     fn new() -> Self {
         KeyState {
-            meta_held: false,
+            modifier_held: false,
             last_ptt_down: None,
             last_ptt_up: None,
             last_toggle: None,
@@ -70,16 +74,15 @@ impl KeyState {
 
 /// Tracked keys, for the startup/keypress log line that makes recognition visible.
 fn tracked(code: u16) -> bool {
-    matches!(code, KEY_D | KEY_KP0 | KEY_RIGHTCTRL | KEY_LEFTMETA | KEY_RIGHTMETA)
+    matches!(code, KEY_L | KEY_KP0 | KEY_RIGHTCTRL | KEY_RIGHTALT)
 }
 
 fn key_name(code: u16) -> &'static str {
     match code {
-        KEY_D => "D",
+        KEY_L => "L",
         KEY_KP0 => "KP0",
         KEY_RIGHTCTRL => "RIGHTCTRL",
-        KEY_LEFTMETA => "LEFTMETA",
-        KEY_RIGHTMETA => "RIGHTMETA",
+        KEY_RIGHTALT => "RIGHTALT",
         _ => "?",
     }
 }
@@ -100,11 +103,12 @@ impl KeyState {
 
 /// Map one EV_KEY event to an action; updates meta-hold tracking and debounce.
 fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
-    // safety: a missed Super keyup (streams out of sync across watchers, or the
-    // press is consumed) would leave meta_held stuck ON forever, so a later plain
-    // D would toggle. If events went quiet for META_IDLE_RESET, the hold is stale.
-    if state.meta_held && state.last_event.elapsed() >= META_IDLE_RESET {
-        state.meta_held = false;
+    // safety: a missed AltGr keyup (streams out of sync across watchers, or the
+    // press is consumed by a remapper like keyd) would leave the hold stuck ON
+    // forever, so a later plain L would toggle. If events went quiet for
+    // MODIFIER_IDLE_RESET, the hold is stale.
+    if state.modifier_held && state.last_event.elapsed() >= MODIFIER_IDLE_RESET {
+        state.modifier_held = false;
     }
     state.last_event = Instant::now();
     match value {
@@ -114,8 +118,8 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
                 state.last_ptt_up = Some(Instant::now());
                 return Some(HotkeyEvent::PttUp);
             }
-            if code == KEY_LEFTMETA || code == KEY_RIGHTMETA {
-                state.meta_held = false;
+            if code == KEY_RIGHTALT {
+                state.modifier_held = false;
             }
             None
         }
@@ -130,13 +134,13 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
                     state.last_toggle = Some(Instant::now());
                     Some(HotkeyEvent::Toggle)
                 }
-                KEY_D if state.meta_held && state.past(&state.last_toggle) => {
-                    state.meta_held = false; // consume Super+D, ignore stray D until next tap
+                KEY_L if state.modifier_held && state.past(&state.last_toggle) => {
+                    state.modifier_held = false; // consume AltGr+L, ignore stray L until next tap
                     state.last_toggle = Some(Instant::now());
                     Some(HotkeyEvent::Toggle)
                 }
-                KEY_LEFTMETA | KEY_RIGHTMETA => {
-                    state.meta_held = true;
+                KEY_RIGHTALT => {
+                    state.modifier_held = true;
                     None
                 }
                 _ => None,
@@ -307,7 +311,7 @@ pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
             }
         }
         if new_watchers > 0 {
-            eprintln!("hk: {armed} input nodes armed (Super+D / NumPad0 = toggle dictation, hold RightCtrl = push-to-talk)");
+            eprintln!("hk: {armed} input nodes armed (AltGr+L / NumPad0 = toggle dictation, hold RightCtrl = push-to-talk)");
         }
         if first_scan {
             if found == 0 {
@@ -345,33 +349,33 @@ mod tests {
     #[test]
     fn d_alone_nothing() {
         let mut s = state();
-        assert_eq!(decide(&mut s, KEY_D, 1), None);
+        assert_eq!(decide(&mut s, KEY_L, 1), None);
     }
 
     #[test]
-    fn meta_d_toggles() {
+    fn altgr_l_toggles() {
         let mut s = state();
-        assert_eq!(decide(&mut s, KEY_LEFTMETA, 1), None);
-        assert_eq!(decide(&mut s, KEY_D, 1), Some(HotkeyEvent::Toggle));
-        assert!(!s.meta_held); // consumed with the toggle, no leak
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
+        assert_eq!(decide(&mut s, KEY_L, 1), Some(HotkeyEvent::Toggle));
+        assert!(!s.modifier_held); // consumed with the toggle, no leak
     }
 
     #[test]
-    fn meta_released_d_nothing() {
+    fn altgr_released_l_nothing() {
         let mut s = state();
-        assert_eq!(decide(&mut s, KEY_RIGHTMETA, 1), None);
-        assert_eq!(decide(&mut s, KEY_RIGHTMETA, 0), None);
-        assert_eq!(decide(&mut s, KEY_D, 1), None);
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 0), None);
+        assert_eq!(decide(&mut s, KEY_L, 1), None);
     }
 
     #[test]
     fn stale_meta_cleared_after_idle_gap() {
-        // Super keydown, then the keyup is lost and the stream goes quiet
+        // AltGr keydown, then the keyup is lost and the stream goes quiet
         let mut s = state();
-        assert_eq!(decide(&mut s, KEY_LEFTMETA, 1), None);
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
         s.last_event = Instant::now() - Duration::from_secs(10); // simulate the gap
-        assert_eq!(decide(&mut s, KEY_D, 1), None); // stale hold must NOT fire a toggle
-        assert!(!s.meta_held);
+        assert_eq!(decide(&mut s, KEY_L, 1), None); // stale hold must NOT fire a toggle
+        assert!(!s.modifier_held);
     }
 
     #[test]

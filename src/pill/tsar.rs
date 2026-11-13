@@ -482,21 +482,7 @@ impl CompositorHandler for PillApp {
         _surface: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
-        let info = self
-            .output_state
-            .info(output)
-            .map(|i| {
-                format!(
-                    "{} model={} loc={:?} logical={:?} scale={}",
-                    i.name.as_deref().unwrap_or("?"),
-                    i.model,
-                    i.location,
-                    i.logical_size,
-                    i.scale_factor
-                )
-            })
-            .unwrap_or_else(|| "<gone>".into());
-        eprintln!("static-dictation: pill surface entered output {info}");
+        let _ = output; // anchor pill to first output; no debug info needed
     }
 
     fn surface_leave(
