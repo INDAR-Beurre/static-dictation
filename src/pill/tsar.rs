@@ -161,11 +161,10 @@ impl Drop for AliveGuard {
 }
 
 /// Loop architecture (chosen): each round is (1) drain `rx` non-blocking,
-/// (2) draw/unmap if dirty, (3) bounded wait for Wayland events (prepare_read +
-/// sleep up to TICK, then read + dispatch_pending). While visible the frame callback
-/// arrives on the socket during the sleep and is dispatched after it, so cadence is
-/// effectively frame-driven at ~20 fps (50 ms cap; compositors that don't send frame
-/// callbacks behave identically). Never busy-spins: every round sleeps or dispatches.
+/// (2) draw if dirty, (3) bounded wait for Wayland events (prepare_read +
+/// sleep up to TICK, then read + dispatch_pending). Cadence is tick-driven
+/// (16 ms); while visible the Ctl stream (audio sim, 16 ms) drives redraws.
+/// Never busy-spins: every round sleeps or dispatches.
 fn render_thread(
     params: WaveParams,
     tx: crossbeam_channel::Sender<Ctl>,
@@ -230,10 +229,6 @@ fn render_thread(
     let output = OutputState::new(&globals, &qh)
         .outputs()
         .next();
-    eprintln!(
-        "static-dictation: pill using explicit output: {}",
-        output.is_some()
-    );
     let layer = layer_shell.create_layer_surface(
         &qh,
         surface,
@@ -462,7 +457,7 @@ impl PillApp {
             Ok(bc) => bc,
             Err(e) => {
                 // Buffers not yet released by the compositor: set the retry flag
-                // so the loop redraws next TICK (50 ms). No frame callback is
+                // so the loop redraws next TICK (16 ms). No frame callback is
                 // pending at this call site, so "the next frame retries" would
                 // never fire and the pill would freeze until the next Ctl.
                 eprintln!("static-dictation: pill create_buffer failed: {e}");
@@ -572,7 +567,6 @@ impl LayerShellHandler for PillApp {
         self.width = NonZeroU32::new(configure.new_size.0).map_or(SURF_W, NonZeroU32::get);
         self.height = NonZeroU32::new(configure.new_size.1).map_or(SURF_H, NonZeroU32::get);
         self.configured = true;
-        eprintln!("static-dictation: pill configured {}x{} (visible={})", self.width, self.height, self.visible);
         // NEVER commit from inside the configure handler: Mango may send several
         // configures back-to-back (bunched), and SCT acks each one as it is
         // dispatched; a commit interleaved between acks desyncs the serial
