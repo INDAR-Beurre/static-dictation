@@ -20,15 +20,20 @@ fn typing_target(wayland: bool, x11: bool) -> Choice {
     }
 }
 
+/// Max chars typed per command: Linux per-arg limit is ~128 KiB (E2BIG); stay well under.
+const MAX_TYPED_CHARS: usize = 100_000;
+
 /// type text into the focused window + stdout + spoken "OK done"
 pub fn deliver(text: &str, no_tts: bool) {
     println!("{text}");
 
+    let typed = clamp_for_typing(flatten_newlines(text));
+
     let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some();
     let x11 = std::env::var_os("DISPLAY").is_some();
     let ok = match typing_target(wayland, x11) {
-        Choice::WlType => type_text("wtype", &[], text) || type_text("xdotool", &["type", "--", "-delay", "0"], text),
-        Choice::Xdotool => type_text("xdotool", &["type", "--", "-delay", "0"], text),
+        Choice::WlType => type_text("wtype", &[], &typed) || type_text("xdotool", &["type", "--", "-delay", "0"], &typed),
+        Choice::Xdotool => type_text("xdotool", &["type", "--", "-delay", "0"], &typed),
         Choice::None => false,
     };
     if !ok {
@@ -51,17 +56,33 @@ pub fn error(msg: &str, no_tts: bool) {
 /// speak a phrase synchronously (espeak-ng preferred, espeak fallback). Best-effort; never panics.
 pub fn speak(text: &str) {
     for bin in ["espeak-ng", "espeak"] {
-        if let Ok(mut child) = Command::new(bin)
+        // output() runs to completion without a blocking wait; Err means spawn failed.
+        if Command::new(bin)
             .arg(text)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
+            .output()
+            .is_ok()
         {
-            // Best-effort: ignore status, but wait so speech is synchronous.
-            let _ = child.wait();
             return;
         }
+    }
+    eprintln!("static-dictation: no TTS available (espeak-ng/espeak not found)");
+}
+
+/// Newlines would be typed as Enter keypresses (submitting chat forms mid-dictation); flatten to spaces.
+fn flatten_newlines(text: &str) -> String {
+    text.replace('\r', " ").replace('\n', " ")
+}
+
+/// Guard against E2BIG: keep the typed arg under the OS per-arg limit.
+fn clamp_for_typing(text: String) -> String {
+    if text.chars().count() <= MAX_TYPED_CHARS {
+        text
+    } else {
+        eprintln!("static-dictation: transcription exceeds {MAX_TYPED_CHARS} chars, truncating typed text");
+        text.chars().take(MAX_TYPED_CHARS).collect()
     }
 }
 
@@ -74,9 +95,9 @@ fn type_text(bin: &str, args: &[&str], text: &str) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .output()
     {
-        Ok(s) => s.success(),
+        Ok(o) => o.status.success(),
         Err(_) => false,
     }
 }
@@ -103,5 +124,14 @@ mod tests {
     #[test]
     fn no_display_is_none() {
         assert_eq!(typing_target(false, false), Choice::None);
+    }
+
+    #[test]
+    fn newlines_become_spaces() {
+        assert_eq!(flatten_newlines("hello\nworld"), "hello world");
+        assert_eq!(flatten_newlines("line1\r\nline2"), "line1  line2");
+        assert_eq!(flatten_newlines("a\rb\nc"), "a b c");
+        assert_eq!(flatten_newlines("no newlines"), "no newlines");
+        assert_eq!(flatten_newlines(""), "");
     }
 }

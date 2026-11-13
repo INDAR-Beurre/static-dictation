@@ -18,17 +18,29 @@ const SILENCE_MS: u32 = 700;
 /// 30 ms frames @ 16 kHz.
 const FRAME: usize = 480;
 /// Keep ~300 ms of pre-voice audio so utterance starts aren't clipped.
-const PRE_ROLL: usize = 4800 * 3 / 10;
+const PRE_ROLL: usize = 4800;
 
 fn main() {
+    // A closed stdout reader (e.g. piped to `head`) must kill us silently, not panic in println.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL); }
+
     let cfg = config::load();
     let pill = pill::PillHandle::try_spawn(); // None = headless, tool works without the pill
 
     let (hk_tx, hk_rx) = unbounded::<HotkeyEvent>();
     std::thread::spawn(move || {
-        if let Err(e) = hk::listen(hk_tx) {
-            eprintln!("hotkey listener failed: {e}");
-            std::process::exit(1);
+        match hk::listen(hk_tx) {
+            Err(e) => {
+                eprintln!("hotkey listener failed: {e}");
+                std::process::exit(1);
+            }
+            // stdin fallback hit EOF/"quit": hotkey source gone → shut down the whole process.
+            Ok(()) => {
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                let _ = std::io::stderr().flush();
+                std::process::exit(0);
+            }
         }
     });
 
@@ -67,6 +79,7 @@ fn main() {
                 }
                 if ep.push(voice) == Decision::End {
                     finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
+                    audio.drop_backlog();
                     // toggle mode keeps going; PTT mode ends when key is released
                 }
             }
@@ -85,14 +98,17 @@ fn main() {
                 HotkeyEvent::PttUp => {
                     recording = false;
                     finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
+                    audio.drop_backlog();
                 }
                 HotkeyEvent::Toggle => {
+                    eprintln!("static-dictation: toggle event received (recording={} )", recording);
                     if recording {
                         recording = false;
                         if let Some(p) = &pill {
                             p.hide();
                         }
                         finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
+                        audio.drop_backlog();
                     } else {
                         ep = endpoint::EndPointer::new(SILENCE_MS);
                         if let Some(p) = &pill {

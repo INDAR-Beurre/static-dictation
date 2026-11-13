@@ -64,6 +64,8 @@
 
 use std::io::Write as _;
 use std::num::NonZeroU32;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
@@ -102,6 +104,7 @@ pub fn spawn_render_thread(
     params: WaveParams,
     tx: crossbeam_channel::Sender<Ctl>,
     rx: crossbeam_channel::Receiver<Ctl>,
+    alive: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     // Requirement: flush before binding so main's banner is ordered before any
     // error output this thread might print on early return.
@@ -111,11 +114,26 @@ pub fn spawn_render_thread(
     std::thread::Builder::new()
         .name("pill-render".into())
         .spawn(move || {
+            // Cleared on EVERY exit path — error returns, Disconnected, panic —
+            // by the guard's Drop (panics unwind through the closure, dropping it).
+            let _guard = AliveGuard { flag: alive };
             if let Err(e) = render_thread(params, tx, rx) {
                 eprintln!("static-dictation: pill render thread died: {e:#}");
             }
         })?;
     Ok(())
+}
+
+/// Sets the shared alive flag false when dropped; the facade (pill.rs) uses the
+/// flag to stop sending Ctls into a channel whose reader is gone.
+struct AliveGuard {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
 }
 
 /// Loop architecture (chosen): each round is (1) drain `rx` non-blocking,
@@ -266,14 +284,16 @@ fn render_thread(
         }
 
         // 3) Redraw when dirty. Hide when never-yet-drawn just skips drawing;
-        // once mapped, hide = unmap (attach None + commit once).
+        // once mapped, hide = unmap (attach None + commit once). Clear the flag
+        // BEFORE drawing: draw() may set it again (buffer-create failure) so the
+        // loop retries on the next tick.
         if app.need_redraw {
+            app.need_redraw = false;
             if app.visible {
                 app.draw(&qh);
             } else if app.ever_drawn {
                 app.unmap();
             }
-            app.need_redraw = false;
         }
 
         // 3b) Any commit above (draw/unmap) must reach the socket NOW: the
@@ -375,7 +395,6 @@ impl PillApp {
         // resolution-independent so it just gets more pixels.
         let scale = self.scale.max(1);
         let stride = width as i32 * scale * 4;
-        eprintln!("static-dictation: pill draw() {}x{} visible={}", width, height, self.visible);
         self.ever_drawn = true;
 
         let (buffer, canvas) = match self.pool.create_buffer(
@@ -386,17 +405,20 @@ impl PillApp {
         ) {
             Ok(bc) => bc,
             Err(e) => {
-                // Buffers not yet released by the compositor: skip this frame;
-                // the next frame callback retries. Not fatal.
+                // Buffers not yet released by the compositor: set the retry flag
+                // so the loop redraws next TICK (50 ms). No frame callback is
+                // pending at this call site, so "the next frame retries" would
+                // never fire and the pill would freeze until the next Ctl.
                 eprintln!("static-dictation: pill create_buffer failed: {e}");
+                self.need_redraw = true;
                 return;
             }
         };
 
         crate::pill::canvas::render_pill(
             canvas,
-            width * scale as u32,
-            height * scale as u32,
+            width as u32 * scale as u32,
+            height as u32 * scale as u32,
             self.sim.bars(),
             self.started.elapsed().as_secs_f32(),
         );
@@ -474,7 +496,7 @@ impl CompositorHandler for PillApp {
                 )
             })
             .unwrap_or_else(|| "<gone>".into());
-        eprintln!("static-dictation: pill surface entered output {info}"); 
+        eprintln!("static-dictation: pill surface entered output {info}");
     }
 
     fn surface_leave(
@@ -495,7 +517,7 @@ impl LayerShellHandler for PillApp {
     fn configure(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
@@ -507,11 +529,16 @@ impl LayerShellHandler for PillApp {
             "static-dictation: pill configured {}x{} (visible={})",
             self.width, self.height, self.visible
         );
-        // First configure: present a real buffer IMMEDIATELY. Never commit a null
-        // buffer as the very first commit — Mango never maps such a layer surface
-        // afterwards (enter never fires). Hide path becomes draw-then-forget; the
-        // alpha-0 canvas keeps it invisible on later frames.
-        self.draw(qh);
+        // NEVER commit from inside the configure handler: Mango may send several
+        // configures back-to-back (bunched), and SCT acks each one as it is
+        // dispatched; a commit interleaved between acks desyncs the serial
+        // ("wrong configure serial" → surface killed). Instead mark dirty and
+        // let the render loop draw+commit AFTER the whole batch is dispatched.
+        // The first commit is still a real buffer: need_redraw was initialized
+        // true — the loop draws before Mango ever sees any null-buffer commit,
+        // so the "Mango never maps a first-null-commit surface" trap is dodged
+        // and the surface still gets its initial buffer on the first tick.
+        self.need_redraw = true;
     }
 }
 

@@ -1,11 +1,13 @@
 //! capture: default input device → 16k mono f32 chunks over a channel.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use crossbeam_channel::unbounded;
+use crossbeam_channel::{bounded, Receiver, TryRecvError, TrySendError};
 
-/// Start default input device; returns rx of f32 chunks @ 16k mono.
-pub fn start() -> Result<crossbeam_channel::Receiver<Vec<f32>>> {
+/// Start default input device; returns a handle yielding f32 chunks @ 16k mono.
+pub fn start() -> Result<AudioIn> {
     let host = cpal::default_host();
     let device = host
         .default_input_device()
@@ -19,7 +21,6 @@ pub fn start() -> Result<crossbeam_channel::Receiver<Vec<f32>>> {
             let mut candidates = device
                 .supported_input_configs()
                 .with_context(|| "querying supported input configs")?
-                .into_iter()
                 .filter(|c| c.sample_format() == cpal::SampleFormat::F32)
                 .flat_map(|c| {
                     // expand to concrete rates we care about
@@ -30,7 +31,7 @@ pub fn start() -> Result<crossbeam_channel::Receiver<Vec<f32>>> {
                             cpal::SupportedStreamConfig::new(
                                 c.channels().min(2),
                                 cpal::SampleRate(r),
-                                c.buffer_size().clone(),
+                                *c.buffer_size(),
                                 cpal::SampleFormat::F32,
                             )
                         })
@@ -48,12 +49,15 @@ pub fn start() -> Result<crossbeam_channel::Receiver<Vec<f32>>> {
 
     let native_rate = config.sample_rate().0;
     let channels = config.channels() as usize;
-    let (tx, rx) = unbounded::<Vec<f32>>();
+    let (tx, rx) = bounded::<Vec<f32>>(256);
+    let (cb_tx, cb_rx) = (tx.clone(), rx.clone());
+    let warned = AtomicBool::new(false);
 
     let err_cb = |e| eprintln!("capture stream error: {e}");
     // shortcut: cpal Stream is !Send, so build+play it on the thread that keeps it.
     let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<()>>(1);
     std::thread::spawn(move || {
+        let mut resampler = Resampler::new();
         let stream = match config.sample_format() {
             cpal::SampleFormat::F32 => device.build_input_stream(
                 &config.into(),
@@ -64,8 +68,21 @@ pub fn start() -> Result<crossbeam_channel::Receiver<Vec<f32>>> {
                     } else {
                         data.chunks_exact(channels).map(|f| f[0]).collect()
                     };
-                    // main.rs buffers and cuts 30 ms frames; pass through as-is
-                    let _ = tx.send(resample(&mono, native_rate));
+                    // resample to 16k, carrying the tail across callbacks
+                    let chunk = resampler.push(&mono, native_rate);
+                    if chunk.is_empty() {
+                        return;
+                    }
+                    // never block the audio callback: on a full queue drop the
+                    // oldest chunk and retry once, else drop the new chunk
+                    if let Err(TrySendError::Full(chunk)) = cb_tx.try_send(chunk) {
+                        let _ = cb_rx.try_recv();
+                        if let Err(TrySendError::Full(_)) = cb_tx.try_send(chunk) {
+                            if !warned.swap(true, Ordering::Relaxed) {
+                                eprintln!("capture: audio queue full, dropping audio");
+                            }
+                        }
+                    }
                 },
                 err_cb,
                 None,
@@ -91,7 +108,61 @@ pub fn start() -> Result<crossbeam_channel::Receiver<Vec<f32>>> {
     });
     init_rx.recv().context("capture thread died before startup result")??;
 
-    Ok(rx)
+    Ok(AudioIn { rx })
+}
+
+/// Handle to the capture stream: bounded queue of 16k mono f32 chunks.
+pub struct AudioIn {
+    rx: Receiver<Vec<f32>>,
+}
+
+impl AudioIn {
+    /// Compat wrapper for main's `while let Ok(chunk) = audio.try_recv()` drain loop.
+    pub fn try_recv(&self) -> Result<Vec<f32>, TryRecvError> {
+        self.rx.try_recv()
+    }
+
+    /// Take every queued chunk into `buf`, leaving the queue empty.
+    pub fn drain_into(&self, buf: &mut Vec<f32>) {
+        while let Ok(chunk) = self.rx.try_recv() {
+            buf.extend_from_slice(&chunk);
+        }
+    }
+
+    /// Discard every queued chunk (audio captured while main was blocked in finalize).
+    pub fn drop_backlog(&self) {
+        while self.rx.try_recv().is_ok() {}
+    }
+}
+
+/// Linear resampler that carries leftover tail samples across callback boundaries.
+struct Resampler {
+    carry: Vec<f32>,
+}
+
+impl Resampler {
+    fn new() -> Self {
+        Self { carry: Vec::new() }
+    }
+
+    /// Resample one callback's worth of input; the dropped tail is kept for next call.
+    fn push(&mut self, input: &[f32], from: u32) -> Vec<f32> {
+        if from == 16000 || input.is_empty() {
+            return input.to_vec();
+        }
+        let mut data = std::mem::take(&mut self.carry);
+        data.extend_from_slice(input);
+        if data.is_empty() {
+            return data;
+        }
+        let out = resample(&data, from);
+        // keep everything from the next output's anchor sample on, so no
+        // input sample is lost at chunk boundaries
+        let ratio = from as f64 / 16000.0;
+        let anchor = ((out.len() as f64) * ratio).floor() as usize;
+        self.carry = data[anchor.min(data.len())..].to_vec();
+        out
+    }
 }
 
 /// Pure linear-interpolation resampler: `from` Hz → 16000 Hz.
@@ -115,7 +186,8 @@ fn resample(input: &[f32], from: u32) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::resample;
+    use super::{resample, AudioIn};
+    use crossbeam_channel::bounded;
 
     #[test]
     fn sine_48k_to_16k_length() {
@@ -140,5 +212,21 @@ mod tests {
     fn empty_in_empty_out() {
         assert!(resample(&[], 44100).is_empty());
         assert!(resample(&[], 16000).is_empty());
+    }
+
+    #[test]
+    fn drain_and_drop_backlog() {
+        let (tx, rx) = bounded::<Vec<f32>>(256);
+        let audio = AudioIn { rx };
+        tx.send(vec![0.1; 10]).unwrap();
+        tx.send(vec![0.2; 10]).unwrap();
+        tx.send(vec![0.3; 10]).unwrap();
+        let mut buf = Vec::new();
+        audio.drain_into(&mut buf);
+        assert_eq!(buf.len(), 30);
+        tx.send(vec![1.0; 5]).unwrap();
+        tx.send(vec![2.0; 5]).unwrap();
+        audio.drop_backlog();
+        assert!(audio.try_recv().is_err());
     }
 }

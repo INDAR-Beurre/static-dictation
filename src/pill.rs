@@ -20,6 +20,7 @@
 //! layer-shell rendering). Both are owned by different subagents; this module wires
 //! them together and must compile when they do.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 mod vecmentor;
@@ -34,6 +35,10 @@ pub struct PillHandle {
 
 struct PillInner {
     tx: crossbeam_channel::Sender<Ctl>,
+    /// Set false by the render thread (via its exit guard) when it is gone for
+    /// any reason. Dead-thread sends would otherwise pile up in the unbounded
+    /// channel forever while main never learns the pill is dead.
+    alive: Arc<AtomicBool>,
 }
 
 /// Commands sent main → render thread.
@@ -49,8 +54,9 @@ impl PillHandle {
     pub fn try_spawn() -> Option<Self> {
         let (tx, rx) = crossbeam_channel::unbounded::<Ctl>();
         let params = vecmentor::wave_params();
-        match tsar::spawn_render_thread(params, tx.clone(), rx) {
-            Ok(()) => Some(Self { inner: Arc::new(PillInner { tx }) }),
+        let alive = Arc::new(AtomicBool::new(true));
+        match tsar::spawn_render_thread(params, tx.clone(), rx, alive.clone()) {
+            Ok(()) => Some(Self { inner: Arc::new(PillInner { tx, alive }) }),
             Err(e) => {
                 eprintln!("static-dictation: pill UI unavailable ({e}); running headless");
                 None
@@ -58,23 +64,39 @@ impl PillHandle {
         }
     }
 
-    /// Non-blocking show request.
+    /// Non-blocking show request. Cheap no-op once the render thread is dead.
     pub fn show(&self) {
+        if !self.inner.alive() {
+            return;
+        }
         let _ = self.inner.tx.send(Ctl::Show);
     }
 
-    /// Non-blocking hide request.
+    /// Non-blocking hide request. Cheap no-op once the render thread is dead.
     pub fn hide(&self) {
+        if !self.inner.alive() {
+            return;
+        }
         let _ = self.inner.tx.send(Ctl::Hide);
     }
 
     /// Non-blocking animation frame. Call at ~30 Hz while visible.
     /// `level` is 0.0..1.0 RMS, over 1.0 = clipped/loud speech (we clamp).
+    /// Cheap no-op once the render thread is dead.
     pub fn update(&self, level: f32, speaking: bool) {
+        if !self.inner.alive() {
+            return;
+        }
         let _ = self
             .inner
             .tx
             .send(Ctl::Update { level: level.clamp(0.0, 2.0), speaking });
+    }
+}
+
+impl PillInner {
+    fn alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 }
 
@@ -96,6 +118,26 @@ mod tests {
             Ok(Ctl::Update { level: 1.5, speaking: true })
         ));
         assert!(matches!(rx.recv(), Ok(Ctl::Hide)));
+    }
+
+    /// After the render thread dies (alive flag false), show/update/hide must
+    /// complete without sending — no unbounded queue growth on a dead thread.
+    #[test]
+    fn dead_thread_ctls_are_noops() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Ctl>();
+        let alive = Arc::new(AtomicBool::new(true));
+        let handle = PillHandle {
+            inner: Arc::new(PillInner { tx, alive: alive.clone() }),
+        };
+        // Sanity: while alive, a send goes through.
+        handle.show();
+        assert!(matches!(rx.try_recv(), Ok(Ctl::Show)));
+        // Simulate render-thread exit (what tsar's AliveGuard does).
+        alive.store(false, Ordering::Release);
+        handle.show();
+        handle.update(0.5, true);
+        handle.hide();
+        assert!(rx.try_recv().is_err(), "no Ctl may be sent after death");
     }
 }
 

@@ -40,11 +40,10 @@ fn compose_endpoint(base: &str) -> String {
 }
 
 pub fn load() -> Config {
-    let groq_api_key = read_key();
-    if groq_api_key.is_none() {
+    let groq_api_key = read_key().unwrap_or_else(|| {
         eprintln!("GROQ_API_KEY not set and no key file at ~/.config/static-dictation/api_key — get one at console.groq.com");
         std::process::exit(1);
-    }
+    });
     let no_tts = match std::env::var("NO_TTS") {
         Ok(v) => !v.is_empty(),
         Err(_) => false,
@@ -52,7 +51,7 @@ pub fn load() -> Config {
     // shortcut: intermediate binding differs from spec's `base_url` field name; main.rs only needs endpoint
     let base = std::env::var("GROQ_BASE_URL").unwrap_or_else(|_| "https://api.groq.com".into());
     Config {
-        groq_api_key: read_key().expect("read_key checked above"),
+        groq_api_key,
         no_tts,
         endpoint: compose_endpoint(&base),
     }

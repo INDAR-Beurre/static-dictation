@@ -21,6 +21,14 @@ const KEY_RIGHTMETA: u16 = 126;
 
 const EV_KEY: u16 = 0x01;
 const DEBOUNCE: Duration = Duration::from_millis(175);
+/// an idle gap this long means a held meta key missed its keyup — stop trusting it
+const META_IDLE_RESET: Duration = Duration::from_secs(2);
+/// bounded reopen attempts for transient device-read errors before the watcher exits
+const REOPEN_ATTEMPTS: u32 = 5;
+const REOPEN_SLEEP: Duration = Duration::from_millis(500);
+/// raw errno values meaning the device node is permanently gone (unplug / removed)
+const ENODEV: i32 = 19;
+const ENOENT: i32 = 2;
 
 #[repr(C)]
 #[allow(dead_code)] // layout documentation; events are parsed from bytes below
@@ -38,17 +46,25 @@ const EVENT_SIZE: usize = 24; // two i64s + type/code/value
 /// Keyboard state shared by ALL device watchers: a grab-and-re-emit chain
 /// (keyd → handy clones → compositor) can deliver Super on one /dev/input node
 /// and D on another; per-device state would split the combo. Shared also makes
-/// the cross-node debounce swallow handy's duplicated physical presses.
+/// the cross-node debounce swallow handy's duplicated physical presses, and
+/// means a meta keyup seen by ANY watcher clears the hold for everyone.
 struct KeyState {
     meta_held: bool,
     last_ptt_down: Option<Instant>,
     last_ptt_up: Option<Instant>,
     last_toggle: Option<Instant>,
+    last_event: Instant, // any tracked stream activity, for the stale-meta safety
 }
 
 impl KeyState {
     fn new() -> Self {
-        KeyState { meta_held: false, last_ptt_down: None, last_ptt_up: None, last_toggle: None }
+        KeyState {
+            meta_held: false,
+            last_ptt_down: None,
+            last_ptt_up: None,
+            last_toggle: None,
+            last_event: Instant::now(),
+        }
     }
 }
 
@@ -68,6 +84,11 @@ fn key_name(code: u16) -> &'static str {
     }
 }
 
+/// True for read errors that mean the device node is permanently gone.
+fn device_gone(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(ENODEV) | Some(ENOENT))
+}
+
 impl KeyState {
     fn past(&self, last: &Option<Instant>) -> bool {
         match last {
@@ -79,9 +100,16 @@ impl KeyState {
 
 /// Map one EV_KEY event to an action; updates meta-hold tracking and debounce.
 fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
+    // safety: a missed Super keyup (streams out of sync across watchers, or the
+    // press is consumed) would leave meta_held stuck ON forever, so a later plain
+    // D would toggle. If events went quiet for META_IDLE_RESET, the hold is stale.
+    if state.meta_held && state.last_event.elapsed() >= META_IDLE_RESET {
+        state.meta_held = false;
+    }
+    state.last_event = Instant::now();
     match value {
         0 => {
-            // release
+            // release: any watcher seeing a meta keyup clears the shared hold
             if code == KEY_RIGHTCTRL && state.past(&state.last_ptt_up) {
                 state.last_ptt_up = Some(Instant::now());
                 return Some(HotkeyEvent::PttUp);
@@ -118,19 +146,44 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
     }
 }
 
+/// Per-kind debounce for the stdin path, mirroring the evdev windows: a burst of
+/// the same event inside DEBOUNCE collapses to one, while distinct lines spaced
+/// ≥ DEBOUNCE apart all pass.
+fn stdin_allowed(st: &mut KeyState, ev: &HotkeyEvent) -> bool {
+    let slot = match ev {
+        HotkeyEvent::PttDown => &mut st.last_ptt_down,
+        HotkeyEvent::PttUp => &mut st.last_ptt_up,
+        HotkeyEvent::Toggle => &mut st.last_toggle,
+    };
+    let ok = match slot {
+        Some(t) => t.elapsed() >= DEBOUNCE,
+        None => true,
+    };
+    if ok {
+        *slot = Some(Instant::now());
+    }
+    ok
+}
+
 fn watch_file(
     path: &str,
     tx: &crossbeam_channel::Sender<HotkeyEvent>,
     state: &std::sync::Arc<std::sync::Mutex<KeyState>>,
+    live: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 ) -> Option<std::thread::JoinHandle<()>> {
     let mut file = File::open(path).ok()?;
+    // the registry is authoritative: never two watchers on one device path
+    if !live.lock().unwrap().insert(path.to_string()) {
+        return None; // a live watcher already owns this path
+    }
     let tx = tx.clone();
     let state = state.clone();
+    let live = live.clone();
     let path = path.to_string(); // owned so it can move into the 'static watcher thread
     let short = path.rsplit('/').next().unwrap_or(&path).to_string();
     Some(std::thread::spawn(move || {
         let mut buf = [0u8; EVENT_SIZE];
-        loop {
+        'watch: loop {
             match file.read_exact(&mut buf) {
                 Ok(()) => {
                     // shortcut: kernel input_event is native-endian; no unsafe
@@ -141,12 +194,16 @@ fn watch_file(
                         if tracked(code) && value != 2 {
                             eprintln!("hk: {short} {} {}", key_name(code), if value == 1 { "press" } else { "release" });
                         }
-                        let mut st = state.lock().unwrap();
-                        if let Some(h) = decide(&mut st, code, value as u8) {
+                        // never hold the state lock across eprintln/send: a closed
+                        // stderr panics eprintln and would poison the shared mutex
+                        let hit = {
+                            let mut st = state.lock().unwrap();
+                            decide(&mut st, code, value as u8)
+                        };
+                        if let Some(h) = hit {
                             eprintln!("hk: {short} -> {h:?}");
-                            drop(st); // don't hold the lock across the channel send
                             if tx.send(h).is_err() {
-                                return; // receiver gone
+                                break 'watch; // receiver gone
                             }
                         }
                     }
@@ -155,27 +212,41 @@ fn watch_file(
                     // reopened a device with no data yet; keep polling
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                Err(_) => {
-                    // ENODEV etc. — device gone or not yet created; retry with a fresh open
-                    loop {
-                        std::thread::sleep(Duration::from_millis(500));
+                Err(e) => {
+                    if device_gone(&e) {
+                        // unplugged: exit cleanly; the rescan re-arms if it returns
+                        break 'watch;
+                    }
+                    // transient error: bounded reopen attempts, then give up
+                    let mut reopened = false;
+                    for _ in 0..REOPEN_ATTEMPTS {
+                        std::thread::sleep(REOPEN_SLEEP);
                         match File::open(&path) {
                             Ok(f) => {
                                 file = f;
+                                reopened = true;
                                 break;
                             }
+                            Err(re) if device_gone(&re) => break,
                             Err(_) => continue,
                         }
                     }
-                },
+                    if !reopened {
+                        break 'watch;
+                    }
+                }
             }
         }
+        // deregister so the rescan may re-arm this path (single live watcher invariant)
+        live.lock().unwrap().remove(&path);
+        eprintln!("hk: {short} watcher exited (device gone or channel closed)");
     }))
 }
 
 fn stdin_fallback(tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
     eprintln!("hk: no readable /dev/input/event* — stdin fallback: empty line or \"start\" = start, \"stop\" = stop, \"toggle\" = toggle, \"quit\" = exit");
     let mut line = String::new();
+    let mut st = KeyState::new(); // same per-kind debounce windows as the evdev path
     loop {
         line.clear();
         let n = std::io::stdin().read_line(&mut line)?;
@@ -183,28 +254,39 @@ fn stdin_fallback(tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
             return Ok(()); // EOF
         }
         let t = line.trim_end_matches(['\n', '\r']).trim();
-        match t {
-            "" | "start" => tx.send(HotkeyEvent::PttDown)?,
-            "stop" => tx.send(HotkeyEvent::PttUp)?,
-            "toggle" => tx.send(HotkeyEvent::Toggle)?,
+        let ev = match t {
+            "" | "start" => Some(HotkeyEvent::PttDown),
+            "stop" => Some(HotkeyEvent::PttUp),
+            "toggle" => Some(HotkeyEvent::Toggle),
             "quit" => return Ok(()),
-            _ => {}
+            _ => None,
+        };
+        if let Some(ev) = ev {
+            if stdin_allowed(&mut st, &ev) {
+                tx.send(ev)?;
+            }
         }
     }
 }
 
 /// Blocks the calling thread forever, sending events. evdev if readable, else stdin fallback.
 /// Rescans /dev/input periodically so hot-plugged keyboards (and uinput test devices)
-/// that appear after startup are picked up. Node names get reused after unplug, so track inodes.
+/// that appear after startup are picked up. A device path is watched by at most one
+/// live thread (the `live` registry); watchers exit on unplug and are re-armed by the
+/// rescan if the node returns.
 pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
     // e2e escape hatch on hosts where evdev grabs/uinput are blocked
     if std::env::var_os("STATIC_DICTATION_STDIN_HOTKEYS").is_some() {
         return stdin_fallback(&tx);
     }
     let state = std::sync::Arc::new(std::sync::Mutex::new(KeyState::new()));
-    let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new(); // (dev, ino)
-    let mut opened = 0;
+    let live: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut armed = 0usize;
+    let mut first_scan = true;
     loop {
+        let mut found = 0usize;
+        let mut new_watchers = 0usize;
         if let Ok(entries) = std::fs::read_dir("/dev/input") {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -212,30 +294,26 @@ pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
                 if !name.starts_with("event") {
                     continue;
                 }
+                found += 1;
                 let path = format!("/dev/input/{}", name);
-                let fstat = std::fs::metadata(&path).ok();
-                let id = match &fstat {
-                    // shortcut: chardev dev() is unstable-ish; (rdev, ino) from raw stat is stable and unique per node
-                    Some(m) => {
-                        use std::os::unix::fs::MetadataExt;
-                        (m.rdev(), m.ino())
-                    }
-                    None => (0, 0),
-                };
-                if !seen.insert(id) {
-                    continue; // already watched (or unwatchable)
+                if live.lock().unwrap().contains(&path) {
+                    continue; // live watcher already owns this path
                 }
-                if watch_file(&path, &tx, &state).is_some() {
-                    opened += 1;
+                if watch_file(&path, &tx, &state, &live).is_some() {
+                    armed += 1;
+                    new_watchers += 1;
                     eprintln!("hk: watching {path}");
                 }
             }
         }
-        if opened > 0 {
-            eprintln!("hk: {opened} input nodes armed (Super+D / NumPad0 = toggle dictation, hold RightCtrl = push-to-talk)");
+        if new_watchers > 0 {
+            eprintln!("hk: {armed} input nodes armed (Super+D / NumPad0 = toggle dictation, hold RightCtrl = push-to-talk)");
         }
-        if opened == 0 && seen.is_empty() {
-            return stdin_fallback(&tx); // nothing readable at all
+        if first_scan {
+            if found == 0 {
+                return stdin_fallback(&tx); // nothing readable at all
+            }
+            first_scan = false;
         }
         // shortcut: 2s poll instead of inotify; fine for a tool that idles at 10ms anyway
         std::thread::sleep(Duration::from_secs(2));
@@ -275,6 +353,7 @@ mod tests {
         let mut s = state();
         assert_eq!(decide(&mut s, KEY_LEFTMETA, 1), None);
         assert_eq!(decide(&mut s, KEY_D, 1), Some(HotkeyEvent::Toggle));
+        assert!(!s.meta_held); // consumed with the toggle, no leak
     }
 
     #[test]
@@ -283,5 +362,25 @@ mod tests {
         assert_eq!(decide(&mut s, KEY_RIGHTMETA, 1), None);
         assert_eq!(decide(&mut s, KEY_RIGHTMETA, 0), None);
         assert_eq!(decide(&mut s, KEY_D, 1), None);
+    }
+
+    #[test]
+    fn stale_meta_cleared_after_idle_gap() {
+        // Super keydown, then the keyup is lost and the stream goes quiet
+        let mut s = state();
+        assert_eq!(decide(&mut s, KEY_LEFTMETA, 1), None);
+        s.last_event = Instant::now() - Duration::from_secs(10); // simulate the gap
+        assert_eq!(decide(&mut s, KEY_D, 1), None); // stale hold must NOT fire a toggle
+        assert!(!s.meta_held);
+    }
+
+    #[test]
+    fn stdin_debounce_collapses_bursts() {
+        let mut s = state();
+        assert!(stdin_allowed(&mut s, &HotkeyEvent::Toggle));
+        assert!(!stdin_allowed(&mut s, &HotkeyEvent::Toggle)); // sub-window repeat swallowed
+        assert!(stdin_allowed(&mut s, &HotkeyEvent::PttDown)); // other kind unaffected
+        std::thread::sleep(DEBOUNCE + Duration::from_millis(30));
+        assert!(stdin_allowed(&mut s, &HotkeyEvent::Toggle)); // a distinct line after the window passes
     }
 }

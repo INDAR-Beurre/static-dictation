@@ -223,9 +223,6 @@ mod tests {
             // every blue byte in range (implies clamping worked; all bytes written same way)
             let _ = v;
         }
-        for chunk in c.chunks_exact(4) {
-            assert!(chunk.iter().all(|&v| v <= 255)); // u8 guarantees it; checks no wrap via arithmetic
-        }
         // Negative / NaN-ish and empty bars also fine.
         let _ = frame(&[-1.0, f32::NAN, 0.0], 1e9);
         let _ = frame(&[], 0.0);
