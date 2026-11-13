@@ -16,9 +16,9 @@
 //! - The thread: drains `rx` (non-blocking at frame cadence), updates vecmentor `Sim`
 //!   via `Sim::push(level, &bands, speaking)` each frame + canvas::render_pill rasterizes.
 //! - `Ctl::Show` → map the surface (fade in, draw frame loop until Hide); `Ctl::Hide`
-//!   → fade out, then unmap (attach transparent/zero buffer  then commit? NO — use
-//!   `wl_surface.attach(None)` via `surface.attach(None::<&wl_buffer>)` then commit,
-//!   or simply destroy + re-create on next Show; pick the simple/safe option).
+//!   → fade out to a fully transparent frame; the surface stays mapped forever
+//!   (never unmap: a null-buffer commit resets wlroots' configured state and
+//!   the next draw dies with protocol error 2 — see loop comment in step 3).
 //!   `Ctl::Update{level,bands,speaking}` → advance sim.
 //! - Use `SlotPool` (smithay_client_toolkit::shm::slot::SlotPool) for buffers; ARGB8888;
 //!   damage full surface each frame; use frame callbacks for cadence (request next
@@ -30,7 +30,7 @@
 //! Sketch of the working pieces (from local SCT 0.21.1 sources — trust these):
 //! ```ignore
 //! use smithay_client_toolkit::{
-//!     compositor::{CompositorState, FrameCallbackData},
+//!     compositor::{CompositorState},
 //!     delegate_registry, registry::RegistryState, registry_handlers,
 //!     shell::wlr_layer::{Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler,
 //!                        LayerSurface, LayerSurfaceConfigure},
@@ -70,7 +70,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState, FrameCallbackData};
+use smithay_client_toolkit::compositor::{CompositorHandler, CompositorState};
 use smithay_client_toolkit::delegate_registry;
 use smithay_client_toolkit::output::{OutputHandler, OutputState};
 use smithay_client_toolkit::registry::{ProvidesRegistryState, RegistryState};
@@ -84,8 +84,8 @@ use smithay_client_toolkit::shm::{Shm, ShmHandler};
 use smithay_client_toolkit::{delegate_dispatch2, registry_handlers};
 use smithay_client_toolkit::reexports::client as wayland_client;
 use wayland_client::globals::registry_queue_init;
-use wayland_client::protocol::{wl_buffer, wl_output, wl_shm, wl_surface};
-use wayland_client::{Connection, EventQueue, QueueHandle};
+use wayland_client::protocol::{wl_output, wl_region, wl_shm, wl_surface};
+use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 use wayland_client::backend::WaylandError;
 
 use crate::pill::canvas::{SURF_W, SURF_H};
@@ -245,6 +245,24 @@ fn render_thread(
     layer.set_size(SURF_W, SURF_H);
     layer.set_margin(48, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+
+    // WHY regions: the pill is a floating overlay — it must never eat clicks and
+    // must never claim opaque pixels it doesn't have.
+    // - Input: the default input region is the whole surface ("infinite"); a
+    //   top-center pill would otherwise steal pointer events from whatever is
+    //   below it. set_input_region with a real, EMPTY region (not the None form
+    //   — None means "infinite"!) makes the overlay click-through. Both region
+    //   requests are double-buffered, so they must be issued BEFORE the first
+    //   commit to cover the surface's whole life.
+    let region = compositor.wl_compositor().create_region(&qh, ());
+    layer.wl_surface().set_input_region(Some(&region));
+    region.destroy();
+    // - Opaque: the protocol DEFAULT is already the empty region, which is what
+    //   a pill with transparent corners + halo needs (alpha blit, not opaque
+    //   copy). Make it explicit anyway so a later edit can't silently regress it
+    //   into Mango's opaque-copy fast path with garbage corner pixels.
+    layer.wl_surface().set_opaque_region(None);
+
     layer.commit();
 
     // Pool borrows shm only during construction; then shm moves into the app.
@@ -272,14 +290,10 @@ fn render_thread(
         height: SURF_H,
         configured: false,
         exited: false,
-        // True once any real buffer has been committed; unmap is only valid then
-        // (Mango never maps a layer surface whose first commit is a null buffer).
         ever_drawn: false,
         scale: 1,
         // Fade state: start fully transparent; Show ramps toward 1.0.
         alpha: 0.0,
-        // Unmap only once per hide; cleared on the next Show.
-        unmapped_this_hide: false,
         pool,
     };
 
@@ -316,21 +330,18 @@ fn render_thread(
 
         // 2b) Advance the fade ramp one tick; sets need_redraw while alpha is
         // still moving toward its target (so fading-out keeps drawing until
-        // alpha bottoms and the loop unmaps).
+        // alpha bottoms at 0 — transparent frame, surface still mapped).
         app.tick_fade();
 
         // 3) Redraw when dirty or mid-fade. Fade-out keeps drawing each tick
-        // until alpha bottoms, then unmaps (once per hide). Clear the flag
-        // BEFORE drawing: draw() may set it again (buffer-create failure) so the
-        // loop retries on the next tick.
+        // until alpha bottoms out at 0 — a fully transparent frame (master_alpha
+        // 0 zeroes every pixel's alpha) — and the surface STAYS MAPPED.
+        // shortcut: never unmaps — a null-buffer commit resets wlroots' configured
+        // state, and the next draw commits pre-configure → protocol error 2 kills
+        // the thread; if the idle pill ever needs to free memory, revisit
         if app.need_redraw || app.alpha != app.fade_target() {
             app.need_redraw = false;
-            if app.visible || app.alpha > 0.0 {
-                app.draw(&qh);
-            } else if app.ever_drawn && !app.unmapped_this_hide {
-                app.unmapped_this_hide = true;
-                app.unmap();
-            }
+            app.draw();
         }
 
         // 3b) Any commit above (draw/unmap) must reach the socket NOW: the
@@ -390,13 +401,11 @@ struct PillApp {
     exited: bool,
     // Compositor-preferred buffer scale (updated by scale_factor_changed).
     scale: i32,
-    // True once any real buffer has been committed; unmap is only valid then
-    // (Mango never maps a layer surface whose first commit is a null buffer).
+    // True once any real buffer has been committed — a surface with a real
+    // buffer attached is never unmapped again (see loop comment in step 3).
     ever_drawn: bool,
     // Current master alpha (0.0..=1.0), eased toward fade_target each tick.
     alpha: f32,
-    // At most one unmap per hide; cleared on the next Show.
-    unmapped_this_hide: bool,
     pool: SlotPool,
 }
 
@@ -419,9 +428,6 @@ impl PillApp {
         match ctl {
             Ctl::Show => {
                 self.visible = true;
-                // A Show mid-fade-out just reverses the ramp from current alpha;
-                // clearing the unmap guard lets the next full hide unmap again.
-                self.unmapped_this_hide = false;
                 self.need_redraw = true;
             }
             Ctl::Hide => {
@@ -437,17 +443,7 @@ impl PillApp {
         }
     }
 
-    /// Hide = unmap: attach no buffer and commit once. The surface object stays
-    /// configured (cheap re-map on next Show: just draw again); the compositor
-    /// removes it from the scene immediately.
-    fn unmap(&mut self) {
-        self.layer
-            .wl_surface()
-            .attach(None::<&wl_buffer::WlBuffer>, 0, 0);
-        self.layer.commit();
-    }
-
-    fn draw(&mut self, qh: &QueueHandle<Self>) {
+    fn draw(&mut self) {
         let width = self.width;
         let height = self.height;
         // Render at the compositor's preferred scale (Mango: 2): buffer pixels =
@@ -487,9 +483,8 @@ impl PillApp {
         self.layer
             .wl_surface()
             .damage_buffer(0, 0, width as i32 * scale, height as i32 * scale);
-        self.layer
-            .wl_surface()
-            .frame(qh, FrameCallbackData(self.layer.wl_surface().clone()));
+        // No frame callback here — see frame() handler: callbacks self-sustain a
+        // dispatch flood on Mango (~190 ms/round) and starve the fade tick.
         buffer.attach_to(self.layer.wl_surface()).ok();
         self.layer.commit();
     }
@@ -525,16 +520,19 @@ impl CompositorHandler for PillApp {
     fn frame(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        // Frame-callback cadence: redraw while mapped (visible or mid-fade-out).
-        // During fade-out these drawn frames keep the cadence until the final
-        // unmap in the main loop; while fully hidden we never request frame
-        // callbacks, so this only fires when mapped.
+        // The render loop is TICK-driven (16 ms) — every redraw there covers the
+        // fade cadence, and Update Ctls arrive at 16 ms granularity anyway.
+        // Requesting a callback inside draw() would self-sustain a frame flood:
+        // callback -> frame() -> draw() -> callback, which starves the loop's
+        // other duties (Mango dispatches these at ~190 ms/round, stretching a
+        // 160 ms fade into ~2 s). So: never request callbacks; draw() is only
+        // called by the loop.
         if self.visible || self.alpha > 0.0 {
-            self.draw(qh);
+            self.need_redraw = true;
         }
     }
 
@@ -574,10 +572,7 @@ impl LayerShellHandler for PillApp {
         self.width = NonZeroU32::new(configure.new_size.0).map_or(SURF_W, NonZeroU32::get);
         self.height = NonZeroU32::new(configure.new_size.1).map_or(SURF_H, NonZeroU32::get);
         self.configured = true;
-        eprintln!(
-            "static-dictation: pill configured {}x{} (visible={})",
-            self.width, self.height, self.visible
-        );
+        eprintln!("static-dictation: pill configured {}x{} (visible={})", self.width, self.height, self.visible);
         // NEVER commit from inside the configure handler: Mango may send several
         // configures back-to-back (bunched), and SCT acks each one as it is
         // dispatched; a commit interleaved between acks desyncs the serial
@@ -637,6 +632,21 @@ impl ProvidesRegistryState for PillApp {
 }
 
 delegate_dispatch2!(PillApp);
+
+// wl_region has no events; wayland_client still requires a Dispatch impl so the
+// queue can own it. Without this the empty input-region object fails to
+// dispatch and the requests never take effect (SCT examples do the same).
+impl Dispatch<wl_region::WlRegion, ()> for PillApp {
+    fn event(
+        _state: &mut Self,
+        _region: &wl_region::WlRegion,
+        _event: wl_region::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
 
 #[cfg(test)]
 mod tests {
