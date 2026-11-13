@@ -365,7 +365,6 @@ fn render_thread(
         height: SURF_H,
         configured: false,
         exited: false,
-        ever_drawn: false,
         scale: 1,
         // Fade state: start fully transparent; Show ramps toward 1.0.
         alpha: 0.0,
@@ -479,9 +478,6 @@ struct PillApp {
     exited: bool,
     // Compositor-preferred buffer scale (updated by scale_factor_changed).
     scale: i32,
-    // True once any real buffer has been committed — a surface with a real
-    // buffer attached is never unmapped again (see loop comment in step 3).
-    ever_drawn: bool,
     // Current master alpha (0.0..=1.0), eased toward fade_target each tick.
     alpha: f32,
     // Entrance/hide bounce: scale factor and its velocity, spring-driven
@@ -570,7 +566,6 @@ impl PillApp {
         // resolution-independent so it just gets more pixels.
         let scale = self.scale.max(1);
         let stride = width as i32 * scale * 4;
-        self.ever_drawn = true;
 
         let (buffer, canvas) = match self.pool.create_buffer(
             width as i32 * scale,
@@ -860,6 +855,7 @@ mod tests {
         let mut excursions = 0u32;
         let mut above = false;
         let mut peaked_above_1_05 = false;
+        let mut second_peak = 0.0f32;
         let mut last_outside_tick = 0usize;
         for i in 0..50 {
             step_grow_tick(&mut grow, &mut vel, true, TICK_SECS);
@@ -867,6 +863,9 @@ mod tests {
             assert!(grow >= 0.0, "tick {i}: grow dipped below 0");
             if grow > 1.0 && !above {
                 excursions += 1;
+            }
+            if excursions == 2 && grow > 1.0 {
+                second_peak = second_peak.max(grow);
             }
             above = grow > 1.0;
             peaked_above_1_05 |= grow > 1.05;
@@ -878,28 +877,39 @@ mod tests {
         // the first one clearly visible (past 1.05).
         assert_eq!(excursions, 2, "want exactly two overshoot wiggles");
         assert!(peaked_above_1_05, "first overshoot must clear 1.05");
-        // Permanently within 1% of 1.0 well inside the ~600 ms budget
-        // (measured: last outside tick is 28 = 448..464 ms).
+        // The bouncy character the user asked for: the second excursion is
+        // still clearly visible (measured peak 1.0201) — never detune flatter.
+        assert!(second_peak > 1.01, "second overshoot too flat: {second_peak}");
+        // Settle budget: the last excursion outside 1% must end by tick 36
+        // ((36+1)·16 ms = 592 ms ≤ the 600 ms budget); measured: tick 28 = 464 ms.
         assert!(
-            last_outside_tick <= 37,
+            last_outside_tick <= 36,
             "still wobbling at tick {last_outside_tick}"
         );
         assert!((grow - 1.0).abs() < 0.01, "end value {grow} drifted");
     }
 
     #[test]
-    fn hide_contraction_reaches_zero_within_250ms() {
+    fn hide_contraction_snaps_within_180_220ms() {
         let mut grow = 1.0f32;
         let mut vel = 0.0f32;
         let mut ticks = 0;
-        while grow > 0.0 && ticks < 16 {
+        while grow > 0.0 && ticks < 25 {
             step_grow_tick(&mut grow, &mut vel, false, TICK_SECS);
             ticks += 1;
-            assert!(grow.is_finite() && grow >= 0.0);
+            assert!(
+                grow.is_finite() && grow >= 0.0,
+                "tick {ticks}: grow={grow}"
+            );
         }
-        assert!(ticks <= 15, "grow stuck at {grow} after {ticks} ticks");
+        assert!(ticks < 25, "grow never snapped (stuck at {grow})");
         assert_eq!(grow, 0.0, "must snap to exactly 0 (grow<0.02 rule)");
-        // 15 ticks = 240 ms of slack inside the 250 ms budget.
+        // Timing budget: 180-220 ms (measured: 12 ticks = 192 ms).
+        let ms = (ticks as u128) * TICK.as_millis();
+        assert!(
+            (180..=220).contains(&ms),
+            "hide contraction took {ms} ms ({ticks} ticks)"
+        );
     }
 
     #[test]
@@ -920,20 +930,23 @@ mod tests {
                 );
             }
             assert!((grow - 1.0).abs() < 0.01, "hide={hide_ticks}: end {grow}");
-            // And the mirror case: Hide arriving mid-Show.
-            let mut grow = 1.0f32;
-            let mut vel = SPRING_KICK;
-            for _ in 0..10 {
-                step_grow_tick(&mut grow, &mut vel, true, TICK_SECS);
+            // And the mirror case: Hide arriving mid-Show, sweeping over the
+            // launch, the 1.25 overshoot plateau, and the way down.
+            for show_ticks in [0usize, 2, 6, 10, 14] {
+                let mut grow = 1.0f32;
+                let mut vel = SPRING_KICK;
+                for _ in 0..show_ticks {
+                    step_grow_tick(&mut grow, &mut vel, true, TICK_SECS);
+                }
+                for round in 0..30 {
+                    step_grow_tick(&mut grow, &mut vel, false, TICK_SECS);
+                    assert!(
+                        grow.is_finite() && (0.0..=1.25).contains(&grow),
+                        "hide@show{show_ticks} tick {round}: grow={grow} vel={vel}"
+                    );
+                }
+                assert_eq!(grow, 0.0);
             }
-            for round in 0..30 {
-                step_grow_tick(&mut grow, &mut vel, false, TICK_SECS);
-                assert!(
-                    grow.is_finite() && (0.0..=1.25).contains(&grow),
-                    "hide-mid-show tick {round}: grow={grow} vel={vel}"
-                );
-            }
-            assert_eq!(grow, 0.0);
         }
     }
 

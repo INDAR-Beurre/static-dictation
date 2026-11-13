@@ -45,8 +45,9 @@ struct PillInner {
     alive: Arc<AtomicBool>,
 }
 
-/// Commands sent main → render thread.
-pub enum Ctl {
+/// Commands sent main → render thread. Internal plumbing: not part of the
+/// facade API (main.rs drives the pill exclusively through `PillHandle`).
+pub(crate) enum Ctl {
     Show,
     Hide,
     Update {
@@ -91,8 +92,10 @@ impl PillHandle {
     }
 
     /// Non-blocking animation frame. Call at ~30 Hz while visible.
-    /// `level` is 0.0..1.0 RMS, over 1.0 = clipped/loud speech (we clamp).
-    /// `bands` is the 9 per-band spectral energies from `bands::energies`.
+    /// `level` is 0.0..2.0 RMS, over 1.0 = clipped/loud speech (clamped here to
+    /// vecmentor's 0.0..2.0 input contract; vecmentor sanitizes NaN/inf too).
+    /// `bands` is the 9 per-band spectral energies from `bands::energies`
+    /// (array literal 9; keep in sync with bands.rs / vecmentor::NUM_BARS).
     /// Cheap no-op once the render thread is dead.
     pub fn update(&self, level: f32, bands: &[f32; 9], speaking: bool) {
         if !self.inner.alive() {
@@ -162,6 +165,27 @@ mod tests {
         handle.update(0.5, &[0.0; 9], true);
         handle.hide();
         assert!(rx.try_recv().is_err(), "no Ctl may be sent after death");
+    }
+
+    /// A dead render thread also drops its `rx`, closing the channel. Show/hide
+    /// sent in that window must stay cheap no-ops — not block or panic (send on
+    /// a closed crossbeam channel returns Err, never blocks; this test pins
+    /// that behavior for the facade's `let _ = send`).
+    #[test]
+    fn dead_channel_sends_are_noops() {
+        let (tx, rx) = crossbeam_channel::unbounded::<Ctl>();
+        let handle = PillHandle {
+            inner: Arc::new(PillInner {
+                tx,
+                alive: Arc::new(AtomicBool::new(true)),
+            }),
+        };
+        drop(rx); // channel closed, as when the render thread has exited
+        handle.show();
+        handle.update(0.5, &[0.0; 9], true);
+        handle.hide();
+        // Nothing to assert beyond "no panic/block" — sends failed silently,
+        // which is exactly the facade contract once the thread is gone.
     }
 }
 
