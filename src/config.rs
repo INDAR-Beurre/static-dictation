@@ -9,6 +9,28 @@ pub struct Config {
     pub endpoint: String,
 }
 
+/// env var wins; else key file (one line, whitespace trimmed). The file was
+/// written by request_secret with 0600 perms so the key never shows in ps/history.
+fn read_key() -> Option<String> {
+    let k = std::env::var("GROQ_API_KEY").ok().filter(|s| !s.trim().is_empty());
+    if let Some(k) = k {
+        return Some(k.trim().to_string());
+    }
+    let path = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let mut p = std::path::PathBuf::from(
+                std::env::var_os("HOME").unwrap_or_else(|| "/root".into()),
+            );
+            p.push(".config");
+            p
+        })
+        .join("static-dictation/api_key");
+    let k = std::fs::read_to_string(path).ok()?;
+    let k = k.trim();
+    if k.is_empty() { None } else { Some(k.to_string()) }
+}
+
 fn compose_endpoint(base: &str) -> String {
     let mut base = base.trim_end_matches('/');
     if base.is_empty() {
@@ -18,9 +40,9 @@ fn compose_endpoint(base: &str) -> String {
 }
 
 pub fn load() -> Config {
-    let groq_api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
-    if groq_api_key.is_empty() || groq_api_key.chars().any(char::is_whitespace) {
-        eprintln!("GROQ_API_KEY not set — get one at console.groq.com");
+    let groq_api_key = read_key();
+    if groq_api_key.is_none() {
+        eprintln!("GROQ_API_KEY not set and no key file at ~/.config/static-dictation/api_key — get one at console.groq.com");
         std::process::exit(1);
     }
     let no_tts = match std::env::var("NO_TTS") {
@@ -30,7 +52,7 @@ pub fn load() -> Config {
     // shortcut: intermediate binding differs from spec's `base_url` field name; main.rs only needs endpoint
     let base = std::env::var("GROQ_BASE_URL").unwrap_or_else(|_| "https://api.groq.com".into());
     Config {
-        groq_api_key,
+        groq_api_key: read_key().expect("read_key checked above"),
         no_tts,
         endpoint: compose_endpoint(&base),
     }
