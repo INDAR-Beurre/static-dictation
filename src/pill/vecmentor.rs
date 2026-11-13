@@ -39,7 +39,7 @@ pub struct WaveParams {
 
 /// Deterministic pseudo-noise per bar: sin-based wobble driven by per-bar phase
 /// counters (no rand crate, deterministic across runs/tests).
-struct Sim {
+pub struct Sim {
     bars: Vec<f32>,
     /// Peak-hold envelope per bar (falls after `peak_hold` pushes).
     peaks: Vec<f32>,
