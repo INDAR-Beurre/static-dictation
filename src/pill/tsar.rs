@@ -88,7 +88,7 @@ use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_output, wl_region, wl_shm, wl_surface};
 use wayland_client::{Connection, Dispatch, EventQueue, QueueHandle};
 
-use crate::pill::canvas::{SURF_H, SURF_W};
+use crate::pill::canvas::{GROW_MAX, SURF_H, SURF_W};
 use crate::pill::vecmentor::{Sim, WaveParams};
 use crate::pill::Ctl;
 
@@ -165,7 +165,7 @@ fn step_grow(cur: f32, vel: f32, target: f32, dt_secs: f32, omega: f32, zeta: f3
     // Clamp both ends: [0, 1.25] matches the canvas's internal clamp, so an
     // overshoot can never ask canvas for an out-of-range scale, and a Hide
     // retarget from a mid-flight bounce can never dip below collapsed.
-    let cur = (cur + vel * dt_secs).clamp(0.0, 1.25);
+    let cur = (cur + vel * dt_secs).clamp(0.0, GROW_MAX);
     (cur, vel)
 }
 
@@ -643,9 +643,18 @@ impl CompositorHandler for PillApp {
         // fade cadence, and Update Ctls arrive at 16 ms granularity anyway.
         // Requesting a callback inside draw() would self-sustain a frame flood:
         // callback -> frame() -> draw() -> callback, which starves the loop's
-        // other duties (Mango dispatches these at ~190 ms/round, stretching a
-        // 160 ms fade into ~2 s). So: never request callbacks; draw() is only
+        // other duties (callbacks arrive ~5-6 ms after commit, stretching a
+        // ~320 ms fade into ~2 s). So: never request callbacks; draw() is only
         // called by the loop.
+        //
+        // CONTRACT (enforced by the `frame_callback_*` tests below): the draw
+        // path must NEVER issue a frame request (`.frame(..)` /
+        // `FrameCallbackData` / `wl_callback`). Under slow compositors the
+        // callback arrives ~5-6 ms after commit, so a
+        // callback→request-frame→callback loop ran at 180+ Hz and starved the
+        // 16 ms tick_fade, stretching a ~320 ms fade into ~2 s (~6×). A frame()
+        // callback arrival may ONLY set need_redraw (as here); the 16 ms TICK
+        // re-arms every redraw.
         if self.visible || self.alpha > 0.0 {
             self.need_redraw = true;
         }
@@ -925,7 +934,7 @@ mod tests {
             for round in 0..60 {
                 step_grow_tick(&mut grow, &mut vel, true, TICK_SECS);
                 assert!(
-                    grow.is_finite() && (0.0..=1.25).contains(&grow),
+                    grow.is_finite() && (0.0..=GROW_MAX).contains(&grow),
                     "hide={hide_ticks} tick {round}: grow={grow} vel={vel}"
                 );
             }
@@ -941,7 +950,7 @@ mod tests {
                 for round in 0..30 {
                     step_grow_tick(&mut grow, &mut vel, false, TICK_SECS);
                     assert!(
-                        grow.is_finite() && (0.0..=1.25).contains(&grow),
+                        grow.is_finite() && (0.0..=GROW_MAX).contains(&grow),
                         "hide@show{show_ticks} tick {round}: grow={grow} vel={vel}"
                     );
                 }
@@ -964,5 +973,101 @@ mod tests {
             SPRING_ZETA_SHOW,
         );
         assert!((g - 0.5).abs() < 0.5 + EPS);
+    }
+
+    // ---- regression guard: the draw path must never request frame callbacks ----
+    //
+    // CONTRACT (see the frame() handler prose above): draw() and the loop must
+    // never issue a frame request. History: a past regression called
+    // wl_surface.frame() from the draw path; under slow compositors (Mango on
+    // this machine) the callback arrived ~5-6 ms after commit, so a
+    // callback→request-frame→callback loop ran at 180+ Hz and starved the
+    // 16 ms tick_fade — a ~320 ms fade stretched to ~2 s (~6×). Fixed in
+    // d07b8c0: frame()/callback handling only sets need_redraw; the 16 ms
+    // TICK re-arms every redraw.
+    //
+    // A real seam test would need a live PillApp, which owns SlotPool and
+    // LayerSurface (unconstructible off-Wayland) — driving it would require a
+    // refactor, which is out of scope. So these are deliberately crude
+    // grep-style source-contract tests: they catch exactly the regression that
+    // shipped and need no refactor.
+
+    /// Source of tsar.rs, for the contract tests below.
+    const TSAR_SRC: &str = include_str!("tsar.rs");
+
+    /// Strip `//` line comments so the tests' own literals (this prose, the
+    /// token lists) cannot self-match the contract assertions.
+    fn strip_line_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| l.split("//").next().unwrap_or(""))
+            .collect::<Vec<&str>>()
+            .join("\n")
+    }
+
+    /// Slice from `start_marker` up to the next function or impl boundary, so
+    /// the scan covers the whole body. Panics if a marker is missing: the
+    /// contract must fail loudly if the code it guards is renamed away.
+    fn body_until_next_fn<'a>(src: &'a str, start_marker: &str) -> &'a str {
+        let start = src
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("contract anchor {start_marker:?} missing"));
+        let rest = &src[start + start_marker.len()..];
+        let end = [rest.find("\nfn "), rest.find("\n    fn ")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn draw_path_never_requests_frame_callbacks() {
+        let code = strip_line_comments(TSAR_SRC);
+        // Whole live (pre-test-module) code: none of the regression tokens may
+        // exist anywhere outside the test module.
+        let live = &code[..code.find("#[cfg(test)]").expect("test module anchor")];
+        for token in [".frame(", "FrameCallbackData", "wl_callback"] {
+            assert!(
+                !live.contains(token),
+                "frame-callback regression: token {token:?} reappeared in live code"
+            );
+        }
+        // And the draw() body specifically — the site where it shipped.
+        let draw = body_until_next_fn(&code, "fn draw(&mut self)");
+        for token in [".frame(", "FrameCallbackData", "wl_callback"] {
+            assert!(!draw.contains(token), "draw() must never contain {token:?}");
+        }
+    }
+
+    #[test]
+    fn frame_callback_sets_only_need_redraw() {
+        let code = strip_line_comments(TSAR_SRC);
+        let handler = body_until_next_fn(&code, "fn frame(");
+        // The callback's only side effect is arming the tick-driven redraw.
+        assert!(
+            handler.contains("need_redraw = true"),
+            "frame() must set need_redraw (the 16 ms tick re-arms rendering)"
+        );
+        for token in ["self.draw(", "commit(", ".frame("] {
+            assert!(
+                !handler.contains(token),
+                "frame() must not {token:?} — draw/commit belongs to the tick loop"
+            );
+        }
+    }
+
+    #[test]
+    fn frame_callback_starve_contract_is_documented() {
+        // The explanatory prose must survive refactors: without it the next
+        // "why not frame callbacks for cadence?" question gets re-answered
+        // wrong. Both phrasings carry the rule and the WHY.
+        assert!(
+            TSAR_SRC.contains("starves") && TSAR_SRC.contains("never request callbacks"),
+            "the frame-callback starvation explanation in the frame() handler was removed"
+        );
+        assert!(
+            TSAR_SRC.contains("stretching a ~320 ms fade into ~2 s"),
+            "the measured regression numbers (~320 ms → ~2 s) were removed"
+        );
     }
 }

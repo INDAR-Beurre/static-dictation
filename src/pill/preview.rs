@@ -31,8 +31,8 @@ use std::f32::consts::PI;
 use std::fs;
 use std::path::PathBuf;
 
-use super::canvas::{render_pill, SURF_H, SURF_W};
-use super::vecmentor::NUM_BARS;
+use super::canvas::{render_pill, GROW_MAX, SURF_H, SURF_W};
+use super::vecmentor::{NUM_BARS, SHAPE_MASK};
 
 const SCALE: u32 = 2;
 const FPS: f32 = 30.0;
@@ -48,8 +48,6 @@ const KICK: f32 = 2.0;
 /// no overshoot, reaches < 0.02 in 12 ticks ≈ 192 ms).
 const OMEGA_HIDE: f32 = 24.0;
 const ZETA_HIDE: f32 = 0.80;
-/// canvas.rs clamps grow to this; clamp here too so keyframes show real size.
-const GROW_MAX: f32 = 1.25;
 
 /// One generated frame of the island story.
 struct Story {
@@ -71,10 +69,11 @@ fn spring_step(x: &mut f32, v: &mut f32, target: f32, omega: f32, zeta: f32, dt:
 fn idle_bars() -> [f32; NUM_BARS] {
     let mut bars = [0.0; NUM_BARS];
     for (i, bar) in bars.iter_mut().enumerate() {
-        // Cosine hump centered on the middle bar: value ≈0.09 at the center
-        // decaying to ≈0.01 at bars 0/8 — edges near zero so the idle row
-        // reads as a small central bunch of dots.
-        *bar = 0.005 + 0.085 * (0.5 + 0.5 * (PI * (i as f32 / 8.0)).cos());
+        // Cosine hump spanning the full bar row, centered on bar 13: value
+        // ≈0.09 at the center decaying to ≈0.005 at bars 0/26 — edges near
+        // zero so the idle row reads as a small central bunch of dots.
+        *bar = 0.005
+            + 0.085 * (0.5 - 0.5 * (2.0 * PI * i as f32 / (NUM_BARS - 1) as f32).cos());
     }
     bars
 }
@@ -99,8 +98,9 @@ fn story() -> Vec<Story> {
     // the measured speech silhouette — quiet ramp (0.06..0.15) → dip →
     // burst cluster (0.60, 0.83, 1.00, 0.84, 0.62) → mirrored fall → one
     // echo syllable (attack/decay pair) → breathing tail. Per-bar targets
-    // spread from the center with vecmentor's spatial envelope (edges ≈28%
-    // of center) plus deterministic breathing variation, then fast-attack /
+    // scale vecmentor's SHAPE_MASK pose by the syllable level (at peak the
+    // bars ARE the mask: hot 5-bar cluster at 11-15 centered on bar 13)
+    // plus deterministic breathing variation, then fast-attack /
     // slow-release smoothing mirrors the live physics.
     const SPEECH_CENTER: [f32; 36] = [
         // ramp       dip  burst cluster               mirrored fall
@@ -114,7 +114,10 @@ fn story() -> Vec<Story> {
         let t = (18 + k) as f32 / FPS;
         let mut target = [0.0; NUM_BARS];
         for (i, tg) in target.iter_mut().enumerate() {
-            let spread = 1.0 - 0.72 * (i as f32 - 4.0).abs() / 4.0;
+            // SHAPE_MASK is vecmentor's spatial envelope — reusing it keeps
+            // the preview's peak pose identical to the designed idle pose
+            // (hot cluster 11-15, edge ramps), not the old 9-bar anchor.
+            let spread = SHAPE_MASK[i];
             let breath = 0.15 * (t * 13.0 + i as f32 * 1.7).sin()
                 + 0.08 * (t * 5.1 + i as f32 * 0.9).sin();
             *tg = (center * spread * (1.0 + breath)).clamp(0.0, 1.0);
@@ -385,6 +388,34 @@ fn island_story_passes_gates() {
         idle_bright * 8 < burst,
         "idle dot row too bright: {idle_bright} vs burst {burst}"
     );
+}
+
+/// The story's peak frame must pose as SHAPE_MASK: hottest bar at the
+/// 1000 Hz cluster center (bar 13), hottest five inside the cluster 11-16.
+#[test]
+fn peak_frame_hot_cluster_is_centered() {
+    let story = story();
+    let peak = (18..54)
+        .max_by(|&a, &b| {
+            let sa: f32 = story[a].bars.iter().sum();
+            let sb: f32 = story[b].bars.iter().sum();
+            sa.total_cmp(&sb)
+        })
+        .unwrap();
+    let bars = &story[peak].bars;
+    let mut order: Vec<usize> = (0..NUM_BARS).collect();
+    order.sort_unstable_by(|&a, &b| bars[b].total_cmp(&bars[a]));
+    let hot = order[0];
+    assert!(
+        (12..=14).contains(&hot),
+        "peak hottest bar {hot} not near 13: {bars:?}"
+    );
+    for &i in &order[..5] {
+        assert!(
+            (11..16).contains(&i),
+            "peak top-5 includes bar {i} outside cluster 11-16: {bars:?}"
+        );
+    }
 }
 
 /// Writes the 70-frame flipbook (`island-000.bmp … island-069.bmp`, 736x208)

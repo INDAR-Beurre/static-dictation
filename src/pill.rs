@@ -8,8 +8,8 @@
 //!   render thread (this module owns it) does all Wayland + drawing work.
 //! - When the pill is visible, `update()` MUST be called at ~30 Hz with the current
 //!   RMS level (0.0..1.0, can exceed for loud speech — clamp internally) and the
-//!   9 per-band spectral energies from `bands::energies` so the animation is lively.
-//!   `speaking` = current VAD voice flag.
+//!   `vecmentor::NUM_BARS` per-band spectral energies from `bands::energies` so
+//!   the animation is lively. `speaking` = current VAD voice flag.
 //! - `show()` should be called right when recording starts, `hide()` when it finalizes.
 //! - The animation: symmetric equalizer-style bars (like the reference image),
 //!   teal/cyan color, gentle glow, smooth level smoothing, peak-hold with decay.
@@ -27,6 +27,8 @@ use std::sync::Arc;
 mod canvas;
 mod tsar;
 pub(crate) mod vecmentor;
+
+use vecmentor::NUM_BARS;
 
 #[cfg(test)]
 mod preview;
@@ -52,7 +54,7 @@ pub(crate) enum Ctl {
     Hide,
     Update {
         level: f32,
-        bands: [f32; 9],
+        bands: [f32; NUM_BARS],
         speaking: bool,
     },
 }
@@ -94,10 +96,10 @@ impl PillHandle {
     /// Non-blocking animation frame. Call at ~30 Hz while visible.
     /// `level` is 0.0..2.0 RMS, over 1.0 = clipped/loud speech (clamped here to
     /// vecmentor's 0.0..2.0 input contract; vecmentor sanitizes NaN/inf too).
-    /// `bands` is the 9 per-band spectral energies from `bands::energies`
-    /// (array literal 9; keep in sync with bands.rs / vecmentor::NUM_BARS).
+    /// `bands` is the `NUM_BARS` per-band spectral energies from
+    /// `bands::energies` (keep in sync with bands.rs / vecmentor::NUM_BARS).
     /// Cheap no-op once the render thread is dead.
-    pub fn update(&self, level: f32, bands: &[f32; 9], speaking: bool) {
+    pub fn update(&self, level: f32, bands: &[f32; NUM_BARS], speaking: bool) {
         if !self.inner.alive() {
             return;
         }
@@ -124,7 +126,7 @@ mod tests {
         // The facade is thin; verify the channel command flow that
         // show/hide/update rely on, without needing Wayland at all.
         let (tx, rx) = crossbeam_channel::unbounded::<Ctl>();
-        let b = [0.1f32; 9];
+        let b = [0.1f32; NUM_BARS];
         tx.send(Ctl::Show).unwrap();
         tx.send(Ctl::Update {
             level: 1.5,
@@ -162,7 +164,7 @@ mod tests {
         // Simulate render-thread exit (what tsar's AliveGuard does).
         alive.store(false, Ordering::Release);
         handle.show();
-        handle.update(0.5, &[0.0; 9], true);
+        handle.update(0.5, &[0.0; NUM_BARS], true);
         handle.hide();
         assert!(rx.try_recv().is_err(), "no Ctl may be sent after death");
     }
@@ -182,7 +184,7 @@ mod tests {
         };
         drop(rx); // channel closed, as when the render thread has exited
         handle.show();
-        handle.update(0.5, &[0.0; 9], true);
+        handle.update(0.5, &[0.0; NUM_BARS], true);
         handle.hide();
         // Nothing to assert beyond "no panic/block" — sends failed silently,
         // which is exactly the facade contract once the thread is gone.
@@ -208,13 +210,13 @@ mod live_tests {
         while t0.elapsed() < Duration::from_secs(3) {
             // Level: sine sweep 0.4..1.2.
             let level = 0.8 + 0.4 * (i as f32 / 7.0).sin();
-            // Bands: one-hot band rotating across the 9 indices, with the
+            // Bands: one-hot band rotating across the 27 indices, with the
             // neighbors trailing at half energy so the sweep looks continuous.
-            let hot = ((i / 4) % 9) as usize;
-            let mut bands = [0.0f32; 9];
+            let hot = ((i / 4) % NUM_BARS as u32) as usize;
+            let mut bands = [0.0f32; NUM_BARS];
             bands[hot] = 1.0;
-            bands[(hot + 8) % 9] = 0.5;
-            bands[(hot + 1) % 9] = 0.5;
+            bands[(hot + NUM_BARS - 1) % NUM_BARS] = 0.5;
+            bands[(hot + 1) % NUM_BARS] = 0.5;
             p.update(level, &bands, !i.is_multiple_of(4)); // speaking ~75% of frames
             i += 1;
             std::thread::sleep(Duration::from_millis(33));
