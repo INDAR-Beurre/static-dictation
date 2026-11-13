@@ -26,8 +26,6 @@ mod vecmentor;
 mod canvas;
 mod tsar;
 
-pub use vecmentor::WaveParams;
-
 /// Public handle to the pill. Clone and send freely.
 #[derive(Clone)]
 pub struct PillHandle {

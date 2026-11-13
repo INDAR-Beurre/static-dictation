@@ -35,8 +35,11 @@ const EVENT_SIZE: usize = 24; // two i64s + type/code/value
 // shortcut: assumed fixed 24-byte native-endian input_event; newer time64 kernels use the same sizes
 // type_, code, value live at offsets 16, 18, 20 regardless of the time encoding.
 
-/// Keyboard state tracked per input device, shared per-thread via decide().
-pub struct KeyState {
+/// Keyboard state shared by ALL device watchers: a grab-and-re-emit chain
+/// (keyd → handy clones → compositor) can deliver Super on one /dev/input node
+/// and D on another; per-device state would split the combo. Shared also makes
+/// the cross-node debounce swallow handy's duplicated physical presses.
+struct KeyState {
     meta_held: bool,
     last_ptt_down: Option<Instant>,
     last_ptt_up: Option<Instant>,
@@ -47,7 +50,25 @@ impl KeyState {
     fn new() -> Self {
         KeyState { meta_held: false, last_ptt_down: None, last_ptt_up: None, last_toggle: None }
     }
+}
 
+/// Tracked keys, for the startup/keypress log line that makes recognition visible.
+fn tracked(code: u16) -> bool {
+    matches!(code, KEY_D | KEY_KP0 | KEY_RIGHTCTRL | KEY_LEFTMETA | KEY_RIGHTMETA)
+}
+
+fn key_name(code: u16) -> &'static str {
+    match code {
+        KEY_D => "D",
+        KEY_KP0 => "KP0",
+        KEY_RIGHTCTRL => "RIGHTCTRL",
+        KEY_LEFTMETA => "LEFTMETA",
+        KEY_RIGHTMETA => "RIGHTMETA",
+        _ => "?",
+    }
+}
+
+impl KeyState {
     fn past(&self, last: &Option<Instant>) -> bool {
         match last {
             Some(t) => t.elapsed() >= DEBOUNCE,
@@ -97,12 +118,17 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
     }
 }
 
-fn watch_file(path: &str, tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Option<std::thread::JoinHandle<()>> {
+fn watch_file(
+    path: &str,
+    tx: &crossbeam_channel::Sender<HotkeyEvent>,
+    state: &std::sync::Arc<std::sync::Mutex<KeyState>>,
+) -> Option<std::thread::JoinHandle<()>> {
     let mut file = File::open(path).ok()?;
     let tx = tx.clone();
+    let state = state.clone();
     let path = path.to_string(); // owned so it can move into the 'static watcher thread
+    let short = path.rsplit('/').next().unwrap_or(&path).to_string();
     Some(std::thread::spawn(move || {
-        let mut state = KeyState::new();
         let mut buf = [0u8; EVENT_SIZE];
         loop {
             match file.read_exact(&mut buf) {
@@ -112,7 +138,13 @@ fn watch_file(path: &str, tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Option
                     let (type_, code, value) = (u16at(16), u16at(18), u16at(20));
                     if type_ == EV_KEY {
                         // value: 0=release 1=press 2=autorepeat; decide() ignores repeat
-                        if let Some(h) = decide(&mut state, code, value as u8) {
+                        if tracked(code) && value != 2 {
+                            eprintln!("hk: {short} {} {}", key_name(code), if value == 1 { "press" } else { "release" });
+                        }
+                        let mut st = state.lock().unwrap();
+                        if let Some(h) = decide(&mut st, code, value as u8) {
+                            eprintln!("hk: {short} -> {h:?}");
+                            drop(st); // don't hold the lock across the channel send
                             if tx.send(h).is_err() {
                                 return; // receiver gone
                             }
@@ -169,6 +201,7 @@ pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
     if std::env::var_os("STATIC_DICTATION_STDIN_HOTKEYS").is_some() {
         return stdin_fallback(&tx);
     }
+    let state = std::sync::Arc::new(std::sync::Mutex::new(KeyState::new()));
     let mut seen: std::collections::HashSet<(u64, u64)> = std::collections::HashSet::new(); // (dev, ino)
     let mut opened = 0;
     loop {
@@ -192,10 +225,14 @@ pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
                 if !seen.insert(id) {
                     continue; // already watched (or unwatchable)
                 }
-                if watch_file(&path, &tx).is_some() {
+                if watch_file(&path, &tx, &state).is_some() {
                     opened += 1;
+                    eprintln!("hk: watching {path}");
                 }
             }
+        }
+        if opened > 0 {
+            eprintln!("hk: {opened} input nodes armed (Super+D / NumPad0 = toggle dictation, hold RightCtrl = push-to-talk)");
         }
         if opened == 0 && seen.is_empty() {
             return stdin_fallback(&tx); // nothing readable at all
