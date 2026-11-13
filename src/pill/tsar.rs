@@ -82,6 +82,7 @@ use smithay_client_toolkit::reexports::client as wayland_client;
 use wayland_client::globals::registry_queue_init;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_shm, wl_surface};
 use wayland_client::{Connection, EventQueue, QueueHandle};
+use wayland_client::backend::WaylandError;
 
 use crate::pill::vecmentor::{Sim, WaveParams};
 use crate::pill::Ctl;
@@ -109,7 +110,11 @@ pub fn spawn_render_thread(
 
     std::thread::Builder::new()
         .name("pill-render".into())
-        .spawn(move || render_thread(params, tx, rx))?;
+        .spawn(move || {
+            if let Err(e) = render_thread(params, tx, rx) {
+                eprintln!("static-dictation: pill render thread died: {e:#}");
+            }
+        })?;
     Ok(())
 }
 
@@ -129,22 +134,70 @@ fn render_thread(
     // driven by rx.try_recv() == Disconnected, i.e. all PillHandle clones dropped.
     drop(tx);
 
-    let conn = Connection::connect_to_env()?;
-    let (globals, mut event_queue) = registry_queue_init(&conn)?;
+    // shortcut: EAGAIN on connect happens when the compositor's accept queue briefly
+    // stalls; a single attempt would permanently lose the pill. Retry ~5×/500ms.
+    let mut last_err = None;
+    let conn = 'c: {
+        for _ in 0..5 {
+            match Connection::connect_to_env() {
+                Ok(c) => break 'c c,
+                Err(e) => {
+                    eprintln!("static-dictation: pill wayland connect failed ({e}); retrying");
+                    last_err = Some(e);
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+        return Err(last_err.expect("at least one connect attempt").into());
+    };
+    let (globals, mut event_queue) = match registry_queue_init(&conn) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("static-dictation: pill step registry_init failed: {e}");
+            return Err(e.into());
+        }
+    };
     let qh = event_queue.handle();
 
     // Each bind can fail (protocol missing) — pill.rs falls back headless on Err.
-    let compositor = CompositorState::bind(&globals, &qh)?;
-    let layer_shell = LayerShell::bind(&globals, &qh)?;
-    let shm = Shm::bind(&globals, &qh)?;
+    let compositor = match CompositorState::bind(&globals, &qh) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("static-dictation: pill step bind_compositor failed: {e}");
+            return Err(e.into());
+        }
+    };
+    let layer_shell = match LayerShell::bind(&globals, &qh) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("static-dictation: pill step bind_layer_shell failed: {e}");
+            return Err(e.into());
+        }
+    };
+    let shm = match Shm::bind(&globals, &qh) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("static-dictation: pill step bind_shm failed: {e}");
+            return Err(e.into());
+        }
+    };
 
     let surface = compositor.create_surface(&qh);
+    // shortcut: output=None is ambiguous on Mango (dead space above eDP-1) — bind
+    // the first real output so the pill anchors to the panel, not nowhere.
+    let output = OutputState::new(&globals, &qh)
+        .outputs()
+        .next();
+    eprintln!(
+        "static-dictation: pill using explicit output: {}",
+        output.is_some()
+    );
     let layer = layer_shell.create_layer_surface(
         &qh,
         surface,
         Layer::Top,
         Some("static-dictation"),
-        None,
+        output.as_ref(),
     );
     layer.set_anchor(Anchor::TOP);
     layer.set_size(PILL_W, PILL_H);
@@ -153,7 +206,13 @@ fn render_thread(
     layer.commit();
 
     // Pool borrows shm only during construction; then shm moves into the app.
-    let pool = SlotPool::new((PILL_W * PILL_H * 4) as usize, &shm)?;
+    let pool = match SlotPool::new((PILL_W * PILL_H * 4 * 4) as usize, &shm) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("static-dictation: pill step slot_pool failed: {e}");
+            return Err(e.into());
+        }
+    };
 
     let mut app = PillApp {
         registry_state: RegistryState::new(&globals),
@@ -168,6 +227,10 @@ fn render_thread(
         height: PILL_H,
         configured: false,
         exited: false,
+        // True once any real buffer has been committed; unmap is only valid then
+        // (Mango never maps a layer surface whose first commit is a null buffer).
+        ever_drawn: false,
+        scale: 1,
         pool,
     };
 
@@ -193,20 +256,32 @@ fn render_thread(
             break;
         }
 
-        // 2) Redraw when dirty. Hide = unmap (attach None + commit once); while
-        // hidden we do no drawing and request no frame callbacks.
+        // 2) Dispatch pending Wayland events BEFORE any commit: a commit racing
+        // an un-acked configure is a protocol error ("wrong configure serial" on
+        // Mango; the surface gets killed). SCT acks configure during dispatch, so
+        // dispatch-first guarantees acks always precede our commits.
+        wait_and_dispatch(&conn, &mut event_queue, &mut app, TICK)?;
+        if app.exited {
+            break;
+        }
+
+        // 3) Redraw when dirty. Hide when never-yet-drawn just skips drawing;
+        // once mapped, hide = unmap (attach None + commit once).
         if app.need_redraw {
             if app.visible {
                 app.draw(&qh);
-            } else {
+            } else if app.ever_drawn {
                 app.unmap();
             }
             app.need_redraw = false;
         }
 
-        // 3) Bounded wait for Wayland events (frame callback, configure, …) so
-        // pending Ctl messages are picked up promptly; no busy spin, ~0% idle CPU.
-        wait_and_dispatch(&conn, &mut event_queue, &mut app, TICK)?;
+        // 3b) Any commit above (draw/unmap) must reach the socket NOW: the
+        // wayland client buffers writes and only flushes during dispatch. Without
+        // this the compositor sees nothing until the next dispatch round.
+        if conn.flush().is_err() {
+            // EPIPE later surfaces as a read error in wait_and_dispatch; exit soon.
+        }
     }
 
     // Dropping `app` (and `conn`) destroys the layer surface: the pill disappears.
@@ -230,7 +305,13 @@ fn wait_and_dispatch(
     // timeout, then read + dispatch. Worst-case frame latency is TICK (50 ms) —
     // ~20 fps, fine for a pill — and idle CPU is one 50 ms sleep per round, ~0%.
     std::thread::sleep(timeout);
-    guard.read()?;
+    match guard.read() {
+        Ok(_) => {}
+        // WouldBlock = no Wayland events during the sleep (normal while unmapped —
+        // compositors send no frame callbacks to hidden surfaces). Not an error.
+        Err(WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(e) => return Err(e.into()),
+    }
     event_queue.dispatch_pending(app)?;
     Ok(())
 }
@@ -248,6 +329,11 @@ struct PillApp {
     height: u32,
     configured: bool,
     exited: bool,
+    // Compositor-preferred buffer scale (updated by scale_factor_changed).
+    scale: i32,
+    // True once any real buffer has been committed; unmap is only valid then
+    // (Mango never maps a layer surface whose first commit is a null buffer).
+    ever_drawn: bool,
     pool: SlotPool,
 }
 
@@ -284,11 +370,17 @@ impl PillApp {
     fn draw(&mut self, qh: &QueueHandle<Self>) {
         let width = self.width;
         let height = self.height;
-        let stride = width as i32 * 4;
+        // Render at the compositor's preferred scale (Mango: 2): buffer pixels =
+        // logical size × scale. The configure size stays logical; the canvas is
+        // resolution-independent so it just gets more pixels.
+        let scale = self.scale.max(1);
+        let stride = width as i32 * scale * 4;
+        eprintln!("static-dictation: pill draw() {}x{} visible={}", width, height, self.visible);
+        self.ever_drawn = true;
 
         let (buffer, canvas) = match self.pool.create_buffer(
-            width as i32,
-            height as i32,
+            width as i32 * scale,
+            height as i32 * scale,
             stride,
             wl_shm::Format::Argb8888,
         ) {
@@ -303,15 +395,15 @@ impl PillApp {
 
         crate::pill::canvas::render_pill(
             canvas,
-            width,
-            height,
+            width * scale as u32,
+            height * scale as u32,
             self.sim.bars(),
             self.started.elapsed().as_secs_f32(),
         );
 
         self.layer
             .wl_surface()
-            .damage_buffer(0, 0, width as i32, height as i32);
+            .damage_buffer(0, 0, width as i32 * scale, height as i32 * scale);
         self.layer
             .wl_surface()
             .frame(qh, FrameCallbackData(self.layer.wl_surface().clone()));
@@ -325,10 +417,17 @@ impl CompositorHandler for PillApp {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        surface: &wl_surface::WlSurface,
+        new_factor: i32,
     ) {
-        // Pill is drawn at fixed size; ignore DPI changes.
+        // Mango advertises scale 2. Render at that scale (canvas multiplies),
+        // and record it so draw() sizes buffers correctly; otherwise the
+        // compositor may refuse to map a scale-1 buffer on a scale-2 output.
+        if new_factor > 0 {
+            self.scale = new_factor;
+            surface.set_buffer_scale(new_factor);
+            self.need_redraw = true;
+        }
     }
 
     fn transform_changed(
@@ -359,8 +458,23 @@ impl CompositorHandler for PillApp {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _surface: &wl_surface::WlSurface,
-        _output: &wl_output::WlOutput,
+        output: &wl_output::WlOutput,
     ) {
+        let info = self
+            .output_state
+            .info(output)
+            .map(|i| {
+                format!(
+                    "{} model={} loc={:?} logical={:?} scale={}",
+                    i.name.as_deref().unwrap_or("?"),
+                    i.model,
+                    i.location,
+                    i.logical_size,
+                    i.scale_factor
+                )
+            })
+            .unwrap_or_else(|| "<gone>".into());
+        eprintln!("static-dictation: pill surface entered output {info}"); 
     }
 
     fn surface_leave(
@@ -389,12 +503,15 @@ impl LayerShellHandler for PillApp {
         self.width = NonZeroU32::new(configure.new_size.0).map_or(PILL_W, NonZeroU32::get);
         self.height = NonZeroU32::new(configure.new_size.1).map_or(PILL_H, NonZeroU32::get);
         self.configured = true;
-        // First configure: do the initial present (unmap commit if hidden).
-        if self.visible {
-            self.draw(qh);
-        } else {
-            self.need_redraw = true;
-        }
+        eprintln!(
+            "static-dictation: pill configured {}x{} (visible={})",
+            self.width, self.height, self.visible
+        );
+        // First configure: present a real buffer IMMEDIATELY. Never commit a null
+        // buffer as the very first commit — Mango never maps such a layer surface
+        // afterwards (enter never fires). Hide path becomes draw-then-forget; the
+        // alpha-0 canvas keeps it invisible on later frames.
+        self.draw(qh);
     }
 }
 

@@ -98,3 +98,31 @@ mod tests {
         assert!(matches!(rx.recv(), Ok(Ctl::Hide)));
     }
 }
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Live visual check (run with --ignored, needs a real compositor + `grim`
+    /// screenshotting mid-run): spawns the real render thread, sends Show plus
+    /// animated Updates at ~30 Hz for 3 s, hides, and drops the handle.
+    /// shortcut: dev harness for the pill-visibility hunt, delete once proven live.
+    #[test]
+    #[ignore]
+    fn pill_show_visible_for_3s() {
+        let p = PillHandle::try_spawn().expect("pill spawn");
+        p.show();
+        let t0 = Instant::now();
+        let mut i = 0u32;
+        while t0.elapsed() < Duration::from_secs(3) {
+            let level = 0.5 + 0.5 * (i as f32 / 9.0).sin(); // sweep so bars animate
+            p.update(level, i % 40 < 30);
+            i += 1;
+            std::thread::sleep(Duration::from_millis(33));
+        }
+        p.hide();
+        std::thread::sleep(Duration::from_millis(400));
+        drop(p);
+    }
+}
