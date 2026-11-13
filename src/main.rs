@@ -6,6 +6,7 @@ mod endpoint;
 mod groq;
 mod hk;
 mod output;
+mod pill;
 mod vad;
 
 use crossbeam_channel::unbounded;
@@ -21,6 +22,7 @@ const PRE_ROLL: usize = 4800 * 3 / 10;
 
 fn main() {
     let cfg = config::load();
+    let pill = pill::PillHandle::try_spawn(); // None = headless, tool works without the pill
 
     let (hk_tx, hk_rx) = unbounded::<HotkeyEvent>();
     std::thread::spawn(move || {
@@ -59,8 +61,12 @@ fn main() {
                     utterance.drain(..excess);
                 }
                 utterance.extend_from_slice(&frame);
+                if let Some(p) = &pill {
+                    let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
+                    p.update(rms, voice);
+                }
                 if ep.push(voice) == Decision::End {
-                    finalize(&cfg, &mut utterance, &mut seen_voice, &mut ep);
+                    finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
                     // toggle mode keeps going; PTT mode ends when key is released
                 }
             }
@@ -71,18 +77,27 @@ fn main() {
             match ev {
                 HotkeyEvent::PttDown => {
                     ep = endpoint::EndPointer::new(SILENCE_MS);
+                    if let Some(p) = &pill {
+                        p.show();
+                    }
                     recording = true;
                 }
                 HotkeyEvent::PttUp => {
                     recording = false;
-                    finalize(&cfg, &mut utterance, &mut seen_voice, &mut ep);
+                    finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
                 }
                 HotkeyEvent::Toggle => {
                     if recording {
                         recording = false;
-                        finalize(&cfg, &mut utterance, &mut seen_voice, &mut ep);
+                        if let Some(p) = &pill {
+                            p.hide();
+                        }
+                        finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
                     } else {
                         ep = endpoint::EndPointer::new(SILENCE_MS);
+                        if let Some(p) = &pill {
+                            p.show();
+                        }
                         recording = true;
                     }
                 }
@@ -99,11 +114,16 @@ fn main() {
 /// Send utterance → groq → output. Blocking; at most one utterance in flight by construction.
 fn finalize(
     cfg: &config::Config,
+    pill: &Option<pill::PillHandle>,
     utterance: &mut Vec<f32>,
     seen_voice: &mut bool,
     ep: &mut endpoint::EndPointer,
 ) {
     *ep = endpoint::EndPointer::new(SILENCE_MS);
+    // Hide before the blocking network call so the pill vanishes the instant dictation stops.
+    if let Some(p) = pill {
+        p.hide();
+    }
     if !*seen_voice || utterance.is_empty() {
         utterance.clear();
         *seen_voice = false;
