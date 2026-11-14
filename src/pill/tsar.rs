@@ -306,7 +306,7 @@ fn render_thread(
     let layer = layer_shell.create_layer_surface(
         &qh,
         surface,
-        Layer::Top,
+        Layer::Overlay, // Top hides under fullscreen apps + T3 Code; overlay floats above windows, like the clock
         Some("static-dictation"),
         output.as_ref(),
     );
