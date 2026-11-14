@@ -513,8 +513,14 @@ mod tests {
         );
         // ...then falls into the dip (deepest at bar 6, inside the reference's
         // [0.08-0.21] dip zone), climbs back toward the cluster...
-        assert!(bars[4] > bars[5] && bars[5] > bars[6], "dip must follow the ramp crest: {bars:?}");
-        assert!(bars[6] < bars[7] && bars[7] < bars[10], "dip must climb back: {bars:?}");
+        assert!(
+            bars[4] > bars[5] && bars[5] > bars[6],
+            "dip must follow the ramp crest: {bars:?}"
+        );
+        assert!(
+            bars[6] < bars[7] && bars[7] < bars[10],
+            "dip must climb back: {bars:?}"
+        );
         // ...and the dip sits well below the cluster's first bar (the cliff
         // into the tall 5-bar center read).
         assert!(

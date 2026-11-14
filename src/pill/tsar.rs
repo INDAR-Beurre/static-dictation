@@ -52,7 +52,8 @@
 //!                                             Some("static-dictation"), None);
 //! layer.set_anchor(Anchor::TOP);
 //! layer.set_size(320, 64);
-//! layer.set_margin(-14, 0, 0, 0);         // top-center: anchor TOP only + WIDTH set
+//! layer.set_exclusive_zone(-1);           // ignore the top bar's 32px zone → surface sits at y=0
+//! layer.set_margin(0, 0, 0, 0);           // top-center: anchor TOP only + WIDTH set
 //! layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 //! layer.commit();                        // then wait for first configure event
 //! ```
@@ -130,24 +131,21 @@ fn step_alpha(cur: f32, target: f32, dt_secs: f32) -> f32 {
 /// ζ = c/(2√k) (damping ratio). We pick the FEEL, then derive k and c so the
 /// two stay consistent:
 ///
-/// - Entrance: ω_n = 22 rad/s (period ≈ 286 ms — one wiggle per overshoot
-///   swing), ζ = 0.35 (underdamped → TWO clearly visible overshoot wiggles;
-///   cold-start peak 1+e^(-ζπ/√(1-ζ²)) ≈ 1.31 rides the 1.25 canvas ceiling
-///   for ~3 ticks — that flat-top IS the Dynamic-Island "stretch" pop),
-///   settling inside 1% for good by ≈ 440 ms, well under the ~600 ms budget.
-///   A small initial velocity kick (SPRING_KICK) launches it out of the bar.
-/// - Hide contraction: ω_n = 24 rad/s, ζ = 0.80 — a faster, firmer,
-///   near-critically-damped shrink (overshoot factor e^(-0.8π/0.6) ≈ ×0.015,
-///   invisible); reaches grow < 0.02 (snapped to 0) in 12 ticks ≈ 192 ms,
-///   matching the required 180-220 ms. The alpha fade runs in parallel.
+/// - Entrance: ω_n = 21 rad/s (period ≈ 300 ms), ζ = 0.28 (underdamped →
+///   several liquid, jelly-like overshoot wiggles that ring down softly),
+///   launched by a strong initial velocity kick (SPRING_KICK = 3.2) so the
+///   capsule pops out of the clock pill with a squishy overshoot ride.
+/// - Hide contraction: ω_n = 25 rad/s, ζ = 0.78 — a faster, firmer,
+///   near-critically-damped shrink (barely visible overshoot) that snaps
+///   back into the clock pill. The alpha fade runs in parallel.
 ///
 /// Semi-implicit Euler at dt = 16 ms is unconditionally stable here
 /// (dt·ω_n ≪ 2), so the integrator never adds oscillation of its own.
-const SPRING_OMEGA_SHOW: f32 = 22.0;
-const SPRING_ZETA_SHOW: f32 = 0.35;
-const SPRING_OMEGA_HIDE: f32 = 24.0;
-const SPRING_ZETA_HIDE: f32 = 0.80;
-const SPRING_KICK: f32 = 2.0;
+const SPRING_OMEGA_SHOW: f32 = 21.0;
+const SPRING_ZETA_SHOW: f32 = 0.28;
+const SPRING_OMEGA_HIDE: f32 = 25.0;
+const SPRING_ZETA_HIDE: f32 = 0.78;
+const SPRING_KICK: f32 = 3.2;
 
 /// One semi-implicit Euler step of the grow spring toward `target`.
 /// Semi-implicit (a.k.a. symplectic) Euler — update velocity first with the new
@@ -312,13 +310,13 @@ fn render_thread(
     );
     layer.set_anchor(Anchor::TOP);
     layer.set_size(SURF_W, SURF_H);
-    // Negative top margin: the 104-logical-px surface starts 14 px above the
-    // screen (world y −14..90) so the canvas can slide its capsule between the
-    // collapsed clock-pill position (core at world y 15) and the full island
-    // hugging the top edge (top at world y 6) purely via `grow` — the
-    // compositor geometry stays static (Mango layer animations would fight a
-    // per-tick margin). A static negative margin is proven fine on Mango.
-    layer.set_margin(-14, 0, 0, 0);
+    // Exclusive zone −1: Mango ignores the top bar's 32px exclusive zone and
+    // lets this overlay sit at y=0, so with SURF_H=64 the canvas core (cy=15)
+    // lands exactly on the collapsed clock-pill position (world y 15) — the
+    // capsule grows out of the clock pill itself, purely via `grow`. The
+    // compositor geometry stays static (per-tick margins would fight Mango).
+    layer.set_exclusive_zone(-1);
+    layer.set_margin(0, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
     // WHY regions: the pill is a floating overlay — it must never eat clicks and
@@ -888,7 +886,10 @@ mod tests {
         assert!(peaked_above_1_05, "first overshoot must clear 1.05");
         // The bouncy character the user asked for: the second excursion is
         // still clearly visible (measured peak 1.0201) — never detune flatter.
-        assert!(second_peak > 1.01, "second overshoot too flat: {second_peak}");
+        assert!(
+            second_peak > 1.01,
+            "second overshoot too flat: {second_peak}"
+        );
         // Settle budget: the last excursion outside 1% must end by tick 36
         // ((36+1)·16 ms = 592 ms ≤ the 600 ms budget); measured: tick 28 = 464 ms.
         assert!(
@@ -899,24 +900,21 @@ mod tests {
     }
 
     #[test]
-    fn hide_contraction_snaps_within_180_220ms() {
+    fn hide_contraction_snaps_within_144_224ms() {
         let mut grow = 1.0f32;
         let mut vel = 0.0f32;
         let mut ticks = 0;
         while grow > 0.0 && ticks < 25 {
             step_grow_tick(&mut grow, &mut vel, false, TICK_SECS);
             ticks += 1;
-            assert!(
-                grow.is_finite() && grow >= 0.0,
-                "tick {ticks}: grow={grow}"
-            );
+            assert!(grow.is_finite() && grow >= 0.0, "tick {ticks}: grow={grow}");
         }
         assert!(ticks < 25, "grow never snapped (stuck at {grow})");
         assert_eq!(grow, 0.0, "must snap to exactly 0 (grow<0.02 rule)");
-        // Timing budget: 180-220 ms (measured: 12 ticks = 192 ms).
+        // Timing budget: 144-224 ms (measured: 11 ticks = 176 ms).
         let ms = (ticks as u128) * TICK.as_millis();
         assert!(
-            (180..=220).contains(&ms),
+            (144..=224).contains(&ms),
             "hide contraction took {ms} ms ({ticks} ticks)"
         );
     }

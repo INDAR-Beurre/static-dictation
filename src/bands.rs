@@ -182,12 +182,7 @@ mod tests {
                 // 0.9, not 0.7: the 27-band log grid puts band 1 at ~322 Hz,
                 // just 72 Hz up — the 250 Hz test tone's skirt legitimately
                 // reaches it; farther bands must stay clearly lower.
-                assert!(
-                    *v < 0.9,
-                    "band {} should be clearly lower, got {}",
-                    i,
-                    v
-                );
+                assert!(*v < 0.9, "band {} should be clearly lower, got {}", i, v);
             }
         }
     }
@@ -200,14 +195,21 @@ mod tests {
             "audible tone must be non-zero"
         );
         let very_quiet = energies(&sine(1000.0, 0.001, N));
-        assert_eq!(very_quiet, [0.0; NUM_BANDS], "very quiet tone must gate to zeros");
+        assert_eq!(
+            very_quiet, [0.0; NUM_BANDS],
+            "very quiet tone must gate to zeros"
+        );
     }
 
     #[test]
     fn noise_fills_bands_within_range() {
         let out = energies(&lcg_noise(N));
         let nonzero = out.iter().filter(|&&v| v > 1e-3).count();
-        assert!(nonzero >= 10, "expected >=10 non-zero bands, got {}", nonzero);
+        assert!(
+            nonzero >= 10,
+            "expected >=10 non-zero bands, got {}",
+            nonzero
+        );
         for v in out {
             assert!(!v.is_nan());
             assert!((0.0..=1.0).contains(&v), "band value {} out of range", v);

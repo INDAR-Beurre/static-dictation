@@ -13,7 +13,7 @@
 //!   never a blank frame)
 //!
 //! NOTE: the entrance spring here mirrors the one live in `tsar.rs`
-//! (semi-implicit Euler, ωn=22 rad/s, ζ=0.35, initial kick 2.0, ceiling 1.25;
+//! (semi-implicit Euler, ωn=21 rad/s, ζ=0.28, initial kick 3.2, ceiling 1.25;
 //! private there — keep the values in sync). `tsar.rs` is the source of
 //! truth for the real animation; this preview only mirrors its constants so
 //! offline flipbooks look like the real thing.
@@ -40,14 +40,14 @@ const DT: f32 = 1.0 / FPS;
 
 /// Entrance-spring constants, mirrored from tsar.rs (SPRING_OMEGA_SHOW,
 /// SPRING_ZETA_SHOW, SPRING_KICK — private there; see module doc).
-const OMEGA: f32 = 22.0;
-const ZETA: f32 = 0.35;
-const KICK: f32 = 2.0;
+const OMEGA: f32 = 21.0;
+const ZETA: f32 = 0.28;
+const KICK: f32 = 3.2;
 /// Hide-contraction spring constants, mirrored from tsar.rs (SPRING_OMEGA_HIDE,
 /// SPRING_ZETA_HIDE — private there; a firmer near-critically-damped shrink,
 /// no overshoot, reaches < 0.02 in 12 ticks ≈ 192 ms).
-const OMEGA_HIDE: f32 = 24.0;
-const ZETA_HIDE: f32 = 0.80;
+const OMEGA_HIDE: f32 = 25.0;
+const ZETA_HIDE: f32 = 0.78;
 
 /// One generated frame of the island story.
 struct Story {
@@ -72,8 +72,7 @@ fn idle_bars() -> [f32; NUM_BARS] {
         // Cosine hump spanning the full bar row, centered on bar 13: value
         // ≈0.09 at the center decaying to ≈0.005 at bars 0/26 — edges near
         // zero so the idle row reads as a small central bunch of dots.
-        *bar = 0.005
-            + 0.085 * (0.5 - 0.5 * (2.0 * PI * i as f32 / (NUM_BARS - 1) as f32).cos());
+        *bar = 0.005 + 0.085 * (0.5 - 0.5 * (2.0 * PI * i as f32 / (NUM_BARS - 1) as f32).cos());
     }
     bars
 }
@@ -91,7 +90,11 @@ fn story() -> Vec<Story> {
         spring_step(&mut grow, &mut gv, 1.0, OMEGA, ZETA, DT);
         let alpha = ((f + 1) as f32 / 4.0).min(1.0);
         grow = grow.clamp(0.0, GROW_MAX);
-        out.push(Story { grow, alpha, bars: idle_bars() });
+        out.push(Story {
+            grow,
+            alpha,
+            bars: idle_bars(),
+        });
     }
 
     // Speech (frames 18..54): hand-crafted center-bar trajectory matching
@@ -106,8 +109,8 @@ fn story() -> Vec<Story> {
         // ramp       dip  burst cluster               mirrored fall
         0.06, 0.10, 0.15, 0.05, 0.60, 0.83, 1.00, 0.84, 0.62, 0.34, 0.18, 0.10, 0.05,
         // echo syllable      breathing tail (wobbles 0.04..0.12, never zero)
-        0.28, 0.55, 0.40, 0.24, 0.12, 0.08, 0.05, 0.09, 0.04, 0.07, 0.11, 0.05,
-        0.08, 0.12, 0.06, 0.09, 0.04, 0.06, 0.10, 0.05, 0.08, 0.11, 0.06,
+        0.28, 0.55, 0.40, 0.24, 0.12, 0.08, 0.05, 0.09, 0.04, 0.07, 0.11, 0.05, 0.08, 0.12, 0.06,
+        0.09, 0.04, 0.06, 0.10, 0.05, 0.08, 0.11, 0.06,
     ];
     let mut bars = idle_bars();
     for (k, &center) in SPEECH_CENTER.iter().enumerate() {
@@ -118,8 +121,8 @@ fn story() -> Vec<Story> {
             // the preview's peak pose identical to the designed idle pose
             // (hot cluster 11-15, edge ramps), not the old 9-bar anchor.
             let spread = SHAPE_MASK[i];
-            let breath = 0.15 * (t * 13.0 + i as f32 * 1.7).sin()
-                + 0.08 * (t * 5.1 + i as f32 * 0.9).sin();
+            let breath =
+                0.15 * (t * 13.0 + i as f32 * 1.7).sin() + 0.08 * (t * 5.1 + i as f32 * 0.9).sin();
             *tg = (center * spread * (1.0 + breath)).clamp(0.0, 1.0);
         }
         for i in 0..NUM_BARS {
@@ -151,7 +154,7 @@ fn story() -> Vec<Story> {
     }
 
     // Hide (frames 62..70): alpha fades to 0 over ~5 frames while grow
-    // contracts with tsar's hide spring (ωn=24, ζ=0.80 — no overshoot),
+    // contracts with tsar's hide spring (ωn=25, ζ=0.78 — no overshoot),
     // starting from the settled state (velocity ≈0), then floored at 0.02.
     let (mut hide_grow, mut hide_vel) = (1.0f32, 0.0f32);
     for local in 0..8u32 {
@@ -331,7 +334,10 @@ fn island_story_passes_gates() {
     // (frame 30: grow=1, alpha=1, mid-speech).
     let (w, h, buf) = render_frame(&story[30], 1.0, 1);
     let center_a = buf[((h / 2 * w + w / 2) * 4 + 3) as usize];
-    assert!(center_a > 200, "capsule interior alpha {center_a} not opaque");
+    assert!(
+        center_a > 200,
+        "capsule interior alpha {center_a} not opaque"
+    );
 
     // Entrance frames must paint a strictly smaller bright footprint than
     // mid-speech frames (the capsule starts small and grows).

@@ -136,13 +136,7 @@ mod tests {
         .unwrap();
         tx.send(Ctl::Hide).unwrap();
         assert!(matches!(rx.recv(), Ok(Ctl::Show)));
-        assert!(matches!(
-            rx.recv(),
-            Ok(Ctl::Update {
-                level: 1.5,
-                ..
-            })
-        ));
+        assert!(matches!(rx.recv(), Ok(Ctl::Update { level: 1.5, .. })));
         assert!(matches!(rx.recv(), Ok(Ctl::Hide)));
     }
 
