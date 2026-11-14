@@ -2,7 +2,8 @@
 
 use anyhow::Result;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -19,6 +20,7 @@ const KEY_RIGHTCTRL: u16 = 97;
 const KEY_RIGHTALT: u16 = 100; // AltGr on most layouts
 
 const EV_KEY: u16 = 0x01;
+const EV_SYN: u16 = 0x00;
 const DEBOUNCE: Duration = Duration::from_millis(175);
 /// an idle gap this long means a held meta key missed its keyup — stop trusting it
 const MODIFIER_IDLE_RESET: Duration = Duration::from_secs(2);
@@ -28,6 +30,19 @@ const REOPEN_SLEEP: Duration = Duration::from_millis(500);
 /// raw errno values meaning the device node is permanently gone (unplug / removed)
 const ENODEV: i32 = 19;
 const ENOENT: i32 = 2;
+
+// uinput / evdev ioctl request codes (values from linux/uinput.h, linux/input.h)
+const UI_SET_EVBIT: libc::c_ulong = 0x4004_5564;
+const UI_SET_KEYBIT: libc::c_ulong = 0x4004_5565;
+const UI_DEV_SETUP: libc::c_ulong = 0x405c_5503;
+const UI_DEV_CREATE: libc::c_ulong = 0x5501;
+const UI_DEV_DESTROY: libc::c_ulong = 0x5502;
+const EVIOCGNAME_128: libc::c_ulong = 0x8080_4506;
+const EVIOCGBIT_KEY_64: libc::c_ulong = 0x8040_4521;
+const EVIOCGRAB: libc::c_ulong = 0x4004_4590;
+
+/// device names we must never watch back: our own virtual keyboard and the test injector
+const SELF_DEVICE_PREFIXES: [&str; 2] = ["static-dictation-kbd", "burst-inject"];
 
 #[repr(C)]
 #[allow(dead_code)] // layout documentation; events are parsed from bytes below
@@ -41,6 +56,78 @@ struct InputEvent {
 const EVENT_SIZE: usize = 24; // two i64s + type/code/value
                               // shortcut: assumed fixed 24-byte native-endian input_event; newer time64 kernels use the same sizes
                               // type_, code, value live at offsets 16, 18, 20 regardless of the time encoding.
+
+/// A minimal virtual keyboard on /dev/uinput, used to re-emit events we grabbed away.
+/// All ioctls are fire-and-forget best-effort: if any setup step fails we mark the device
+/// invalid and Drop skips UI_DEV_DESTROY (kernel cleans up an un-created fd on close anyway).
+struct UinputKbd {
+    file: std::fs::File,
+    ok: bool,
+}
+
+#[repr(C)]
+struct UinputSetup {
+    id: [u16; 4], // bustype, vendor, product, version
+    name: [u8; 80],
+    ff_effects_max: u32,
+}
+
+impl UinputKbd {
+    fn new() -> Option<Self> {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/uinput")
+            .ok()?;
+        let mut dev = UinputKbd { file, ok: true };
+        // enable every key code 1..=248 so re-emitted events are always accepted
+        for code in 1..=248u16 {
+            dev.ioctl(UI_SET_KEYBIT, code as libc::c_ulong);
+        }
+        dev.ioctl(UI_SET_EVBIT, EV_KEY as libc::c_ulong);
+        dev.ioctl(UI_SET_EVBIT, EV_SYN as libc::c_ulong);
+        let name_bytes = b"static-dictation-kbd\0";
+        let mut name = [0u8; 80];
+        name[..name_bytes.len()].copy_from_slice(name_bytes);
+        let setup = UinputSetup {
+            id: [0x03, 0x1235, 0x5679, 1],
+            name,
+            ff_effects_max: 0,
+        };
+        dev.ok &= unsafe {
+            libc::ioctl(
+                dev.file.as_raw_fd(),
+                UI_DEV_SETUP,
+                &setup as *const UinputSetup,
+            )
+        } == 0;
+        dev.ok &= unsafe { libc::ioctl(dev.file.as_raw_fd(), UI_DEV_CREATE) } == 0;
+        if !dev.ok {
+            return None;
+        }
+        Some(dev)
+    }
+
+    fn ioctl(&mut self, req: libc::c_ulong, arg: libc::c_ulong) {
+        self.ok &= unsafe { libc::ioctl(self.file.as_raw_fd(), req, arg) } == 0;
+    }
+
+    /// Emit one raw event struct (as 24 bytes) followed by a SYN separator.
+    fn emit(&mut self, event: &[u8; EVENT_SIZE]) {
+        let mut syn = [0u8; EVENT_SIZE];
+        syn[16..18].copy_from_slice(&EV_SYN.to_ne_bytes());
+        if self.file.write_all(event).is_err() || self.file.write_all(&syn).is_err() {
+            eprintln!("hk: uinput write failed");
+        }
+    }
+}
+
+impl Drop for UinputKbd {
+    fn drop(&mut self) {
+        if self.ok {
+            unsafe { libc::ioctl(self.file.as_raw_fd(), UI_DEV_DESTROY) };
+        }
+    }
+}
 
 /// Keyboard state shared by ALL device watchers: a grab-and-re-emit chain
 /// (keyd → handy clones → compositor) can deliver Super on one /dev/input node
@@ -90,6 +177,28 @@ fn key_name(code: u16) -> &'static str {
 /// True for read errors that mean the device node is permanently gone.
 fn device_gone(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(ENODEV) | Some(ENOENT))
+}
+
+/// True if this device is our own virtual keyboard (or the e2e test injector).
+fn is_self_device(fd: std::os::fd::RawFd) -> bool {
+    let mut name = [0u8; 128];
+    let n = unsafe { libc::ioctl(fd, EVIOCGNAME_128, name.as_mut_ptr()) };
+    if n <= 0 {
+        return false;
+    }
+    let name = String::from_utf8_lossy(&name[..(n as usize).min(128)]);
+    SELF_DEVICE_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// True if the device's key bitmap carries both keys of the AltGr+L combo.
+fn has_altgr_l(fd: std::os::fd::RawFd) -> bool {
+    let mut bits = [0u8; 64];
+    let n = unsafe { libc::ioctl(fd, EVIOCGBIT_KEY_64, bits.as_mut_ptr()) };
+    if n <= 0 {
+        return false;
+    }
+    let has = |code: u16| bits[(code / 8) as usize] & (1 << (code % 8)) != 0;
+    has(KEY_L) && has(KEY_RIGHTALT)
 }
 
 impl KeyState {
@@ -174,8 +283,29 @@ fn watch_file(
     tx: &crossbeam_channel::Sender<HotkeyEvent>,
     state: &std::sync::Arc<std::sync::Mutex<KeyState>>,
     live: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    uinput: &std::sync::Arc<std::sync::Mutex<Option<UinputKbd>>>,
 ) -> Option<std::thread::JoinHandle<()>> {
-    let mut file = File::open(path).ok()?;
+    let mut file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(_) => File::open(path).ok()?, // read-only watcher on a write-protected node
+    };
+    if is_self_device(file.as_raw_fd()) {
+        return None; // never watch our own virtual keyboard (or the test injector)
+    }
+    // Grab the device when it can produce the full AltGr+L combo, so L never
+    // reaches the focused window; EBUSY (another grabber) falls back to read-only.
+    let mut grabbed = false;
+    if uinput.lock().unwrap().is_some() && has_altgr_l(file.as_raw_fd()) {
+        let arg: libc::c_int = 1;
+        grabbed = unsafe { libc::ioctl(file.as_raw_fd(), EVIOCGRAB, arg) } == 0;
+    }
+    if grabbed {
+        eprintln!("hk: {path} grabbed (AltGr+L will not type into windows)");
+    }
     // the registry is authoritative: never two watchers on one device path
     if !live.lock().unwrap().insert(path.to_string()) {
         return None; // a live watcher already owns this path
@@ -183,10 +313,12 @@ fn watch_file(
     let tx = tx.clone();
     let state = state.clone();
     let live = live.clone();
+    let uinput = uinput.clone();
     let path = path.to_string(); // owned so it can move into the 'static watcher thread
     let short = path.rsplit('/').next().unwrap_or(&path).to_string();
     Some(std::thread::spawn(move || {
         let mut buf = [0u8; EVENT_SIZE];
+        let mut l_swallowed = false; // L press that fired the toggle; repeats/release also hidden
         'watch: loop {
             match file.read_exact(&mut buf) {
                 Ok(()) => {
@@ -208,6 +340,25 @@ fn watch_file(
                             let mut st = state.lock().unwrap();
                             decide(&mut st, code, value as u8)
                         };
+                        // while grabbed, hide the AltGr+L keystroke (and its autorepeats) so
+                        // "l" never reaches the focused window; a plain L is forwarded untouched
+                        let mut swallow = false;
+                        if grabbed && code == KEY_L {
+                            if value == 1 && hit == Some(HotkeyEvent::Toggle) {
+                                l_swallowed = true;
+                                swallow = true;
+                            } else if (value == 2 || value == 0) && l_swallowed {
+                                swallow = true;
+                                if value == 0 {
+                                    l_swallowed = false; // L is free again after the release
+                                }
+                            }
+                        }
+                        if !swallow {
+                            if let Some(dev) = uinput.lock().unwrap().as_mut() {
+                                dev.emit(&buf);
+                            }
+                        }
                         if let Some(h) = hit {
                             eprintln!("hk: {short} -> {h:?}");
                             if tx.send(h).is_err() {
@@ -290,6 +441,10 @@ pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
     let state = std::sync::Arc::new(std::sync::Mutex::new(KeyState::new()));
     let live: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+    // ONE shared virtual keyboard for re-emitting grabbed events; None on hosts
+    // without /dev/uinput access, in which case grabbing is disabled everywhere
+    let uinput: std::sync::Arc<std::sync::Mutex<Option<UinputKbd>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(UinputKbd::new()));
     let mut armed = 0usize;
     let mut first_scan = true;
     loop {
@@ -307,7 +462,7 @@ pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
                 if live.lock().unwrap().contains(&path) {
                     continue; // live watcher already owns this path
                 }
-                if watch_file(&path, &tx, &state, &live).is_some() {
+                if watch_file(&path, &tx, &state, &live, &uinput).is_some() {
                     armed += 1;
                     new_watchers += 1;
                     eprintln!("hk: watching {path}");
@@ -390,5 +545,48 @@ mod tests {
         assert!(stdin_allowed(&mut s, &HotkeyEvent::PttDown)); // other kind unaffected
         std::thread::sleep(DEBOUNCE + Duration::from_millis(30));
         assert!(stdin_allowed(&mut s, &HotkeyEvent::Toggle)); // a distinct line after the window passes
+    }
+
+    /// The swallow rule in watch_file: AltGr+L hides press/repeat/release of L
+    /// from the uinput re-emit, plain L passes through untouched.
+    #[test]
+    fn altgr_l_swallow_only_when_toggled() {
+        let mut s = state();
+        let mut l_swallowed = false;
+        let swallow = |l_swallowed: &mut bool, value: u8, hit: Option<HotkeyEvent>| -> bool {
+            let mut sw = false;
+            if value == 1 && hit == Some(HotkeyEvent::Toggle) {
+                *l_swallowed = true;
+                sw = true;
+            } else if (value == 2 || value == 0) && *l_swallowed {
+                sw = true;
+                if value == 0 {
+                    *l_swallowed = false;
+                }
+            }
+            let _ = s;
+            sw
+        };
+
+        // plain L (no AltGr): press/repeat/release all forwarded
+        let hit = decide(&mut s, KEY_L, 1);
+        assert_eq!(hit, None);
+        assert!(!swallow(&mut l_swallowed, 1, hit.clone()));
+        assert!(!swallow(&mut l_swallowed, 2, hit.clone()));
+        assert!(!swallow(&mut l_swallowed, 0, hit));
+
+        // AltGr+L: press swallowed, autorepeat swallowed, release swallowed and frees L
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
+        let hit = decide(&mut s, KEY_L, 1);
+        assert_eq!(hit, Some(HotkeyEvent::Toggle));
+        assert!(swallow(&mut l_swallowed, 1, hit));
+        assert!(swallow(&mut l_swallowed, 2, None)); // repeat hidden
+        assert!(swallow(&mut l_swallowed, 0, None)); // release hidden
+        assert!(!l_swallowed);
+
+        // after the release a fresh plain L is forwarded again
+        let hit = decide(&mut s, KEY_L, 1);
+        assert_eq!(hit, None);
+        assert!(!swallow(&mut l_swallowed, 1, hit));
     }
 }
