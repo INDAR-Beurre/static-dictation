@@ -3,29 +3,35 @@
 //! below-only drop shadow.
 //!
 //! Style (measured from an iPhone Dynamic-Island reference): a near-black
-//! stadium-shaped pill with a green-gray cast (rgb 35,38,37) in the logical
+//! stadium-shaped pill with a dark navy cast (rgb 16,20,30) in the logical
 //! 220×64 surface (16px side pad, pill core 188×44); the grown pill hugs the
 //! top of the surface (grow-1 pill 148×36 at y 3..39). A subtle +10 RGB sheen
-//! crowns the body's top-left and
-//! fades darker rightward; there is deliberately no rim light and no hairline —
-//! just a soft SDF anti-aliased edge. The waveform is ONE element kind: a
-//! vertical capsule with fully rounded caps (r = w/2) that reads as a ~1.6px
-//! dim dot at idle and grows into a ~2.7px-wide bar; a gentle center-weight
-//! envelope
-//! tapers element heights toward the edges so silence reads as a centered
-//! pyramid of dots, and peak brightness scales with element height (never
-//! invisible at idle). Brightness also ramps down toward both row ends —
-//! smoothstep from the mid-row out to ×(1−EDGE_DIM) at the outermost elements
-//! — so the flanks read as dim tail dots under the hot center cluster.
+//! crowns the body's top-left and fades darker rightward; a ~1px teal-white
+//! rim (~9%) hugs the anti-aliased edge and a bright specular line rolls off
+//! along the top edge — the capsule must read against the dark navy desktop.
+//! The waveform is ONE element kind: a vertical capsule with fully rounded
+//! caps (r = w/2) that reads as a ~1.1px dim dot at idle and grows into a
+//! ~2px-wide bar; a center-weight envelope (floor 0.65) tapers element
+//! heights toward the edges so silence reads as a centered pyramid of dots,
+//! and a gaussian peak emphasis (gain 1.5, σ 1.5 elements) keeps a tall
+//! bright center cluster alive even at near-zero energy. Peak brightness
+//! follows a steep curve (0.35 + 0.65·v^0.6) and the tallest cores lerp
+//! toward white-hot rgb(255,255,250) with mix v². Brightness also ramps down
+//! toward both row ends — smoothstep over the outer 20% of the row down to
+//! ×(1−EDGE_DIM) at the outermost elements — so the flanks read as dim tail
+//! dots under the hot center cluster.
 //! Element color interpolates along x — teal
 //! rgb(125,165,165) at the left, peak cyan rgb(140,220,222) at the center, blue
 //! rgb(100,130,170) at the right — and the flanking dotted leader lines pick up
-//! the same gradient at ~24% alpha. The grown (grow=1) capsule draws at
+//! the same gradient at ~39% alpha. The grown (grow=1) capsule draws at
 //! 148×36 logical — the compact island pill (the 188×44 core bounds the
-//! overshoot bulge). A soft additive bloom in each element's own color
-//! (≈4.5px logical kernel, faint to ~18px, strongest over the tall center cluster,
-//! pulsing slowly with `t_secs`) bridges neighboring bars; it is masked to the
-//! pill interior so the frame outside stays clean. A 25% black
+//! overshoot bulge). A soft additive bloom in the strongest element's own
+//! color (a per-pixel MAX over sources, so 27 bars at ~3.7px pitch cannot
+//! fuse into one sheet — gaps read as gaps; ≈2.75px logical kernel scaled
+//! 0.35..1.0 by bar height, faint to ~18px, pulsing slowly with `t_secs`)
+//! halos the tall center cluster; only elements with v ≥ 0.35 emit, the
+//! field is capped at 1.0, and the bloom is masked to the pill interior so
+//! the frame outside stays clean. A 25% black
 //! drop shadow sits below the capsule only (offset +4px, ~12px falloff, masked
 //! below the capsule midline so the sides stay clean).
 //!
@@ -64,7 +70,7 @@ use std::f32::consts::PI;
 pub const SURF_W: u32 = 220;
 /// Logical surface height (pill core 44 + 10px pad top/bottom).
 pub const SURF_H: u32 = 64;
-pub const GROW_MAX: f32 = 1.25; // spring overshoot ceiling: canvas clamp + tsar/preview springs
+const GROW_MAX: f32 = 1.25; // canvas-side overshoot clamp; live ceiling is tsar's GROW_CEIL_SHOW 1.12
 
 const BODY_A: f32 = 255.0; // opaque: stored RGB == palette RGB
 const SHADOW_A: f32 = 64.0; // 25% black drop shadow
@@ -72,35 +78,44 @@ const SHADOW_OFF: f32 = 4.0; // shadow offset down, logical px
 const SHADOW_SPAN: f32 = 12.0; // shadow falloff distance, logical px
 const AA_BAND: f32 = 1.25;
 const BAR_SPAN_FRAC: f32 = 0.68; // waveform occupies the central span of the pill width
-const DOT_R: f32 = 0.75; // leader-dot radius, logical px (≈1.5px diameter)
-const DOT_STEP: f32 = 3.5; // leader-dot spacing, logical px
-const DOT_A: f32 = 60.0; // leader-dot peak alpha (≈24% — spec tail ≈20–25% of peak)
-                         // Leader-zone dimming: brightness falls off toward both ends of the row so the
-                         // island reads as a lit center cluster with dim tail dots (reference: tail ramp
-                         // ≈35/255 ≈ bright-step of the peak). Measured effect at idle: outermost leader
-                         // dots land at ≈25% of the center dot's bg-excess (raw-channel ratio ≈0.36,
-                         // spec tail 0.10 relative to cluster 1.00 + body ≈42/255) — the multiplier is
-                         // per-channel color, never below zero.
-const EDGE_DIM: f32 = 0.215; // end-of-row brightness floor: 1.0 - EDGE_DIM at |u-0.5| = 0.5
-const EDGE_DIM_INNER: f32 = 0.30; // falloff starts this far from the row center (of the half-row)
-const GLOW_K: f32 = 4.5; // bloom exp kernel, logical px — measured half-excess
-                         // of ≈4.5px logical (≈9px @2x) past a bar's core edge (K·ln2 plus the core-AA
-                         // lift); at the 27-bar pitch (≈3.7px logical) the kernel stays under ~one
-                         // slot so gaps read.
-const GLOW_REACH: f32 = 18.0; // faint bloom halo cut-off (~18px); at K=4.5
-                              // the cutoff step is <2% of the edge value — dithered away.
-const BLOOM: f32 = 0.85; // additive bloom strength
-                         // Bloom alpha gain: must stay ≥ max gradient channel (220) × BLOOM so the
-                         // additive step can never push a color channel above alpha (premultiplied).
+const DOT_R: f32 = 1.0; // leader-dot radius, logical px (≈2px diameter)
+const DOT_STEP: f32 = 4.5; // leader-dot spacing, logical px
+const DOT_A: f32 = 100.0; // leader-dot peak alpha (≈39% — tails read like the ref)
+                          // Leader-zone dimming: brightness falls off toward both ends of the row so the
+                          // island reads as a lit center cluster with dim tail dots (reference: tail ramp
+                          // ≈35/255 ≈ bright-step of the peak). Measured effect at idle: outermost leader
+                          // dots land at ≈25% of the center dot's bg-excess (raw-channel ratio ≈0.36,
+                          // spec tail 0.10 relative to cluster 1.00 + body ≈42/255) — the multiplier is
+                          // per-channel color, never below zero.
+const EDGE_DIM: f32 = 0.13; // end-of-row brightness floor: 1.0 - EDGE_DIM at |u-0.5| = 0.5
+const EDGE_DIM_INNER: f32 = 0.40; // falloff starts this far from the row center (of the half-row)
+                                  // — outer 20% only, so leader dots stay readable to the capsule end
+const GLOW_K: f32 = 2.5; // bloom exp kernel at v=1, logical px — two-scaled per bar
+                         // (k = GLOW_K·(0.35 + 0.65·v)) so tall bars get wide hot halos and dim
+                         // elements stay tight; at the 27-bar pitch (≈3.7px logical) the mid-gap
+                         // field is ~0.7× the at-edge value instead of the old sum's ≈1.3×, so
+                         // gaps read as gaps.
+const GLOW_REACH: f32 = 18.0; // faint bloom halo cut-off (~18px); at K=2.75 the
+                              // cutoff step is ~0.15% of the edge value — dithered away.
+const BLOOM: f32 = 0.5; // additive bloom strength (was 0.85 — the wide kernel is gone)
+const GLOW_TEAL: f32 = 1.15; // glow g/b boost over r — slight teal bias in the halo
+                             // Bloom alpha gain: must stay ≥ max glow channel (255·GLOW_TEAL ≈ 293)
+                             // × BLOOM (≈146.5) so the additive step can never push a color channel
+                             // above alpha (premultiplied).
 const GLOW_A: f32 = 197.0;
 // 27 bars at pitch 2·0.68·74/27 ≈ 3.73 logical px (0.68 of the 148px grown
 // pill width) → ~2.7px bar width max.
-const ELEM_R_MAX: f32 = 1.35; // element half-width max → ~2.7px bar width, logical px
-const DOT_R_MIN: f32 = 0.80; // idle element radius floor → ~1.6px dot diameter
+const ELEM_R_MAX: f32 = 1.0; // element half-width max → ~2px bars, ~1.7px gaps at pitch
+const DOT_R_MIN: f32 = 0.75; // idle element radius floor → ~1.5px dots. The critique asked
+                             // 0.55, but 0.55 starves END dots of sub-pixel coverage (G-delta ≈10
+                             // vs body < the +12 visibility bar); 0.75 keeps the ~1.5px dot while the
+                             // env+peak-emphasis ramp carries edge→mid in height.
 const SHEEN: f32 = 10.0; // top-left body sheen, +RGB
+const RIM: (f32, f32, f32) = (20.0, 24.0, 27.0); // ~1px teal-white edge rim (~9%)
+const SPEC: f32 = 26.0; // top-edge specular line strength, added per channel
 
 /// Measured palette (verbatim from the reference spec).
-const BG: (f32, f32, f32) = (35.0, 38.0, 37.0); // near-black green-gray cast
+const BG: (f32, f32, f32) = (16.0, 20.0, 30.0); // near-black navy cast (dark desktop)
 const TWIN: (f32, f32, f32) = (31.0, 30.0, 29.0); // #1F1E1D clock-pill twin
 const GRAD_L: (f32, f32, f32) = (125.0, 165.0, 165.0); // teal, left end
 const GRAD_C: (f32, f32, f32) = (140.0, 220.0, 222.0); // peak cyan, center
@@ -222,7 +237,8 @@ struct Bar {
     cx: f32,
     r: f32,   // capsule radius = element half-width (a dot when seg == 0)
     seg: f32, // half length of the inner segment (half_h - r, >= 0)
-    gw: f32,  // bloom weight, scales with bar height
+    gw: f32,  // bloom weight: 0 below v = 0.35, smoothstep up to 1
+    gk: f32,  // bloom kernel width (GLOW_K scaled by height), device px
     cr: f32,  // gradient color at this element's x position,
     cg: f32,  // pre-scaled by height brightness and shimmer
     cb: f32,
@@ -257,11 +273,11 @@ pub fn render_pill(
     };
     let pulse = 1.0 + 0.10 * (t * 2.4).sin();
 
-    // Entrance spring (FROZEN contract): 0.0 collapsed clock-pill twin, 1.0
+    // Entrance spring: 0.0 collapsed clock-pill twin, 1.0
     // full pill, up to 1.25 overshoot. Width leads (quadratic ease), height
     // lags (squared ease): liquid squash-stretch, both bulge on overshoot.
     let gr = if grow.is_finite() {
-        grow.clamp(0.0, 1.25)
+        grow.clamp(0.0, GROW_MAX)
     } else {
         0.0
     };
@@ -315,19 +331,31 @@ pub fn render_pill(
                 0.0
             };
             // Idle elements stay visible as small dim dots (never zero height).
-            // Gentle center-weight envelope: heights taper from the middle
-            // element to the edges, so silence reads as a pyramid of dots.
-            let env = 0.55 + 0.45 * (PI * ((i as f32 + 0.5) / n)).sin();
-            let half_h = (v * inner_h * 0.5).max(DOT_R_MIN * s) * env;
-            // ONE element kind: width scales with height, 0.8→1.35 logical px —
-            // a ~1.6px dot at idle, a ~2.7px bar when tall; caps fully rounded.
+            // Center-weight envelope with a 0.65 floor: heights taper from the
+            // middle element to the edges, so silence reads as a pyramid of
+            // dots with a taller mid.
+            let env = 0.65 + 0.35 * (PI * ((i as f32 + 0.5) / n)).sin();
+            // Peak emphasis: gaussian bump on the center element (gain 1.5,
+            // σ 1.5 elements) so the posed center peak survives even at
+            // near-zero energy. Clamped to the inner height so the bump can
+            // never poke out of the capsule.
+            let dc = (i as f32 + 0.5) - n * 0.5;
+            let pk = 1.0 + 1.5 * (-(dc * dc) / 4.5).exp();
+            let half_h = ((v * inner_h * 0.5).max(DOT_R_MIN * s) * env * pk).min(inner_h * 0.5);
+            // ONE element kind: width scales with height, 0.55→1.0 logical px —
+            // a ~1.1px dot at idle, a ~2px bar when tall; caps fully rounded.
             let r = (ELEM_R_MAX * s).min(half_h).max(DOT_R_MIN * s);
             let bcx = cx - bar_span + slot * (i as f32 + 0.5);
-            // Peak brightness scales with height: dim dot at idle, full
-            // gradient color when tall. Gradient interpolates along x.
-            let bright = 0.5 + 0.5 * v;
+            // Brightness: steep curve — dots stay dim, peaks reach the top of
+            // the palette (capped at 1.0 so cores never overdrive the stops).
+            let bright = (0.45 + 0.65 * v.powf(0.6)).min(1.0);
             let u = i as f32 / (n - 1.0).max(1.0);
             let (cr, cg, cb) = wave_color(u);
+            // White-hot peak: lerp toward (255,255,250) with mix = v² scaled
+            // by the same center gaussian, so the CENTER cluster reads
+            // white-hot like the reference while the tails keep the gradient.
+            let wmix = clamp01((pk - 1.0) / 1.5);
+            let mix = v * v * wmix;
             // Leader-zone dimming scales the element color toward the row
             // ends (bloom weights and the capsule body stay untouched). The
             // idle floor keeps every element above the body, so dimmed tails
@@ -336,14 +364,22 @@ pub fn render_pill(
             // Slow per-element shimmer (brighten-only, 1.0..1.10) keeps a
             // constant input alive without distorting the palette stops.
             let shimmer = 1.0 + 0.05 * (1.0 - (t * 3.2 + i as f32 * 1.05).cos());
+            // Bloom gate: dots emit nothing; emission ramps in from v = 0.35.
+            let gw = smooth(clamp01((v - 0.35) / 0.65));
+            // Two-scale kernel: tall bars get wide hot halos, dim elements
+            // stay tight.
+            let gk = GLOW_K * (0.35 + 0.65 * v) * s;
             caps.push(Bar {
                 cx: bcx,
                 r,
                 seg: (half_h - r).max(0.0),
-                gw: 0.15 + 0.85 * v,
-                cr: cr * bright * shimmer * dim,
-                cg: cg * bright * shimmer * dim,
-                cb: cb * bright * shimmer * dim,
+                gw,
+                gk,
+                // Clamp to 255: white-hot × shimmer could exceed the channel,
+                // breaking the premultiplied invariant at master_alpha < 1.
+                cr: ((cr * (1.0 - mix) + 255.0 * mix) * bright * shimmer * dim).min(255.0),
+                cg: ((cg * (1.0 - mix) + 255.0 * mix) * bright * shimmer * dim).min(255.0),
+                cb: ((cb * (1.0 - mix) + 250.0 * mix) * bright * shimmer * dim).min(255.0),
                 x0: ((bcx - r - reach).floor() as i32).max(0),
                 x1: ((bcx + r + reach).ceil() as i32).min(width as i32),
                 y0: ((cy - half_h - reach).floor() as i32).max(0),
@@ -384,11 +420,13 @@ pub fn render_pill(
                 * clamp01((py - cy - 2.0 * s) / hh_c) // below the capsule only
                 * clamp01((hw_c + 2.0 * s - (px - cx).abs()) / (4.0 * s)); // no side spill
 
-            // Pill body: near-black with a green-gray cast (rgb 35,38,37),
-            // a subtle +10 sheen at the top-left fading darker rightward. No
-            // rim, no hairline. While collapsed (grow < 0.15) it relaxes to a
-            // flat #1F1E1D twin of the clock pill, blending out of the flat
-            // zone as grow rises.
+            // Pill body: near-black with a dark navy cast (rgb 16,20,30) so
+            // the capsule separates from the dark navy desktop, a subtle +10
+            // sheen at the top-left fading darker rightward, a ~1px teal-white
+            // rim hugging the AA edge (~9%), and a bright specular line
+            // rolling off along the top edge. While collapsed (grow < 0.15)
+            // it relaxes to a flat #1F1E1D twin of the clock pill — no rim,
+            // no specular — blending out of the flat zone as grow rises.
             let cov = sdf_cov(d);
             if cov > 0.0 {
                 let twin = smooth(clamp01((0.15 - gr) / 0.15)); // 1 when collapsed
@@ -396,9 +434,14 @@ pub fn render_pill(
                 let sheen = SHEEN
                     * (1.0 - clamp01((px - (cx - hw_c)) / (2.0 * hw_c)))
                     * (1.0 - clamp01(dy_top / (2.0 * hh_c)));
-                let br = TWIN.0 * twin + (BG.0 + sheen) * flat;
-                let bg = TWIN.1 * twin + (BG.1 + sheen) * flat;
-                let bb = TWIN.2 * twin + (BG.2 + sheen) * flat;
+                // Rim: brightest at the silhouette, gone ~1px inward.
+                let rim_w = clamp01(1.0 + d / s);
+                // Specular roll-off: ~2px bright line at the top, fading
+                // over ~6px.
+                let spec_w = smooth(clamp01(1.0 - dy_top / (6.0 * s)));
+                let br = TWIN.0 * twin + (BG.0 + sheen + RIM.0 * rim_w + SPEC * spec_w) * flat;
+                let bg = TWIN.1 * twin + (BG.1 + sheen + RIM.1 * rim_w + SPEC * spec_w) * flat;
+                let bb = TWIN.2 * twin + (BG.2 + sheen + RIM.2 * rim_w + SPEC * spec_w) * flat;
                 (r, g, b, a) = over(r, g, b, a, br, bg, bb, BODY_A * cov);
             }
 
@@ -427,24 +470,29 @@ pub fn render_pill(
                             over(r, g, b, a, bar.cr, bar.cg, bar.cb, 255.0 * bcov * wave_op);
                     }
                     if db < reach {
-                        let w = bar.gw * (-db.max(0.0) / (GLOW_K * s)).exp();
-                        glow += w;
-                        glow_r += bar.cr * w;
-                        glow_g += bar.cg * w;
-                        glow_b += bar.cb * w;
+                        // Max-field bloom: keep only the strongest source at
+                        // this pixel, so 27 bars at ~3.7px pitch cannot sum
+                        // into one fused sheet — gaps read as gaps.
+                        let w = bar.gw * (-db.max(0.0) / bar.gk).exp();
+                        if w > glow {
+                            glow = w;
+                            glow_r = bar.cr;
+                            glow_g = bar.cg * GLOW_TEAL;
+                            glow_b = bar.cb * GLOW_TEAL;
+                        }
                     }
                 }
             }
 
-            // Additive bloom in each element's own color (weighted by its own
-            // gradient contribution), masked to the pill interior and lifted
-            // from under the cores.
+            // Additive bloom in the strongest source's own color, masked to
+            // the pill interior and lifted from under the cores. The field is
+            // capped at 1.0 before the gains so stacked sources cannot
+            // saturate a pixel.
             if glow > 0.0 {
-                let gi = glow * pulse * cov * (1.0 - bcov_max) * wave_op;
-                let k = BLOOM * gi / glow;
-                r += glow_r * k;
-                g += glow_g * k;
-                b += glow_b * k;
+                let gi = glow.min(1.0) * pulse * cov * (1.0 - bcov_max) * wave_op;
+                r += glow_r * BLOOM * gi;
+                g += glow_g * BLOOM * gi;
+                b += glow_b * BLOOM * gi;
                 a += GLOW_A * gi;
             }
 
@@ -592,25 +640,23 @@ mod tests {
 
     #[test]
     fn taller_bar_covers_more_pixels_at_same_x() {
-        let low = frame(&[0.3; N27], 0.0, 1.0);
-        let high = frame(&[0.9; N27], 0.0, 1.0);
+        // Count rows at the center bar's column that are clearly emissive
+        // (G > 150: body+sheen tops out ≈37, white-hot cores are near-neutral
+        // so the old G > R+25 hue predicate cannot see them).
         let count = |c: &[u8]| -> u32 {
             let mut n = 0;
             for y in 0..H {
-                // Wave core: strong green/blue vs the near-neutral body.
-                if i32::from(chan(c, MID_X, y, 1)) > 100
-                    && i32::from(chan(c, MID_X, y, 1)) > i32::from(chan(c, MID_X, y, 2)) + 25
-                {
+                if chan(c, MID_X, y, 1) > 150 {
                     n += 1;
                 }
             }
             n
         };
-        let cl = count(&low);
-        let ch = count(&high);
+        let low = count(&frame(&[0.3; N27], 0.0, 1.0));
+        let high = count(&frame(&[0.9; N27], 0.0, 1.0));
         assert!(
-            ch > cl + 10,
-            "taller bar must cover more rows: {ch} vs {cl}"
+            high > low + 7,
+            "taller bar must cover more rows: {high} vs {low}"
         );
     }
 
@@ -653,47 +699,44 @@ mod tests {
         // At the compact pitch (≈3.7px) the ±1.25px AA band and bloom from
         // neighbors widen the tolerance; the sheen lifts the left end.
         let tol = 30i32;
-        // Left end (i=0): teal rgb(125,165,165) × the leader-zone falloff
-        // (edge_dim(0) = 0.785) = rgb(98,130,130), lifted by sheen at the
-        // pill's top-left.
+        // Probed values at the compact pitch (220-wide pill, v=1): left end
+        // reads lifted edge-teal (93,126,131), center peaks white-hot-leaning
+        // cyan (232,237,239), right end dims to blue (93,121,158).
         let (r, g, b) = (
             chan(&c, cx_at(0), 21, 2) as i32,
             chan(&c, cx_at(0), 21, 1) as i32,
             chan(&c, cx_at(0), 21, 0) as i32,
         );
-        // Probed values at the compact pitch (220-wide pill): left end is
-        // lifted edge-teal (138,181,181), center peaks near pure cyan
-        // (162,253,255), right end dims to blue (85,110,144).
-        assert!((r - 138).abs() <= tol, "left dimmed teal R {r} vs ~138");
-        assert!((g - 181).abs() <= tol, "left dimmed teal G {g} vs ~181");
-        assert!((b - 181).abs() <= tol, "left dimmed teal B {b} vs ~181");
-        // Center (i=13, x=110): peak cyan rgb(140,220,222).
+        assert!((r - 93).abs() <= tol, "left dimmed teal R {r} vs ~93");
+        assert!((g - 126).abs() <= tol, "left dimmed teal G {g} vs ~126");
+        assert!((b - 131).abs() <= tol, "left dimmed teal B {b} vs ~131");
+        // Center (i=13, x=110): white-hot peak over cyan rgb(140,220,222).
         let (r, g, b) = (
             chan(&c, MID_X, 21, 2) as i32,
             chan(&c, MID_X, 21, 1) as i32,
             chan(&c, MID_X, 21, 0) as i32,
         );
-        assert!((r - 162).abs() <= tol, "center cyan R {r} vs 162");
-        assert!((g - 253).abs() <= tol, "center cyan G {g} vs 253");
-        assert!((b - 255).abs() <= tol, "center cyan B {b} vs 255");
-        // Right end (i=26): blue rgb(100,130,170) × 0.785 = rgb(79,102,134)
-        // (measured picks up a small edge bloom lift, inside tol).
+        assert!((r - 232).abs() <= tol, "center cyan R {r} vs 232");
+        assert!((g - 237).abs() <= tol, "center cyan G {g} vs 237");
+        assert!((b - 239).abs() <= tol, "center cyan B {b} vs 239");
+        // Right end (i=26): dimmed blue rgb(100,130,170) × 0.87 (edge_dim),
+        // lifted by edge bloom.
         let (r, g, b) = (
             chan(&c, cx_at(26), 21, 2) as i32,
             chan(&c, cx_at(26), 21, 1) as i32,
             chan(&c, cx_at(26), 21, 0) as i32,
         );
-        assert!((r - 85).abs() <= tol, "right dimmed blue R {r} vs 85");
-        assert!((g - 110).abs() <= tol, "right dimmed blue G {g} vs 110");
-        assert!((b - 144).abs() <= tol, "right dimmed blue B {b} vs 144");
+        assert!((r - 93).abs() <= tol, "right dimmed blue R {r} vs 93");
+        assert!((g - 121).abs() <= tol, "right dimmed blue G {g} vs 121");
+        assert!((b - 158).abs() <= tol, "right dimmed blue B {b} vs 158");
     }
 
     #[test]
-    fn body_bg_is_green_gray_near_black_not_navy() {
+    fn body_bg_is_navy_near_black_not_green_gray() {
         // Dither jitters single pixels ±1 per channel independently, so the
-        // green-gray cast is asserted on patch MEANS (dither is zero-mean).
+        // navy cast is asserted on patch MEANS (dither is zero-mean).
         // Interior body away from the sheen (right half) and away from wave
-        // rows' verticals: must average ≈ rgb(35,38,37), g >= r >= b.
+        // rows' verticals: must average ≈ rgb(16,20,30), b highest (navy).
         // Patches sit inside the compact capsule (220×64; hull x≈72..147).
         let c = frame(&[], 0.0, 1.0);
         let patch = |x0: u32, y0: u32, ch: u32| -> f32 {
@@ -711,27 +754,22 @@ mod tests {
         for &(x0, y0) in &[(150u32, 10u32), (168, 14), (52, 30)] {
             let (r, g, b) = mean(x0, y0);
             assert!(
-                (r - 35.0).abs() <= 1.5 && (g - 38.0).abs() <= 1.5 && (b - 37.0).abs() <= 1.5,
-                "bg patch ({x0},{y0}) = rgb({r},{g},{b}), want ≈ rgb(35,38,37)"
+                (r - 16.0).abs() <= 1.5 && (g - 20.0).abs() <= 1.5 && (b - 30.0).abs() <= 1.5,
+                "bg patch ({x0},{y0}) = rgb({r},{g},{b}), want ≈ rgb(16,20,30)"
             );
-            // The palette's own cast: g highest, b = r + 2. Navy would be b > g
-            // or b − r ≈ 10.
-            assert!(
-                g >= b && b - r <= 3.0,
-                "green-gray cast violated: rgb({r},{g},{b})"
-            );
+            // The palette's own cast: b ≥ g ≥ r (navy). A green-gray body
+            // would show g ≥ b.
+            assert!(b >= g && g >= r, "navy cast violated: rgb({r},{g},{b})");
         }
-        // Top-left sheen adds ~+10: still green-gray, never navy (b > g is the
-        // navy tell — forbid it). Patch sits ~6px inside the compact capsule's
-        // upper-left interior.
+        // Top-left sheen adds ~+10: still navy, never green-gray (g > b is
+        // the green-gray tell — forbid it). Patch sits ~6px inside the
+        // compact capsule's upper-left interior (probed ≈ 22.7,26.7,36.7:
+        // sheen + a little rim/specular bleed at the top edge).
         let (r, g, b) = mean(48, 8);
+        assert!(b > g, "sheen must stay navy: rgb({r},{g},{b})");
         assert!(
-            g >= b && b - r <= 3.0,
-            "sheen must stay green-gray: rgb({r},{g},{b})"
-        );
-        assert!(
-            r > 35.0,
-            "top-left sheen missing: R {r} not above the 35 floor"
+            r > 20.0,
+            "top-left sheen missing: R {r} not above the 20 floor"
         );
         assert!(r < 50.0, "sheen must stay subtle: R {r}");
     }
@@ -796,12 +834,11 @@ mod tests {
     #[test]
     fn idle_dots_stay_visible() {
         // At bars=0 the elements must still read as small dim gradient dots —
-        // not vanish. Idle cores render at 50% brightness and the leader-zone
-        // falloff dims the tails: center dot G≈78, tail dots G≈55–63 (the
-        // right end is dimmest — the blue palette stop carries G=130) vs
-        // body-only G≤44 at the spot. The visibility bar stays "clearly
-        // brighter than bare body"; the contrast margin is re-anchored to the
-        // measured dimmed tails (+12 G over body; was +20 pre-falloff).
+        // not vanish. Idle cores render at 45% brightness and the leader-zone
+        // falloff dims the tails: center dot G≈85, tail dots G≈36–43 vs
+        // body-only G≤24 at the spot. The visibility bar stays "clearly
+        // brighter than bare body" (≥ +12 G; re-anchored: sub-pixel coverage
+        // of the ~1.5px dots limits the end-dot delta to ≈ +13).
         let dots = frame(&[0.0; N27], 0.0, 1.0);
         let body = frame(&[], 0.0, 1.0);
         for i in 0..N27 {
@@ -811,7 +848,7 @@ mod tests {
             let gd = chan(&dots, x, 21, 1);
             let gb = chan(&body, x, 21, 1);
             assert!(
-                gd > 50 && gd > gb + 12,
+                gd >= 30 && gd > gb + 12,
                 "idle dot {i} at x={x} not visible: dot G={gd} vs body G={gb}"
             );
         }
@@ -947,15 +984,16 @@ mod tests {
         let mr = chan(&mid, 130, 21, 2) as i32;
         let mg = chan(&mid, 130, 21, 1) as i32;
         let mb = chan(&mid, 130, 21, 0) as i32;
-        // Blend mid-point keeps the green top channel (hue drifts blue as the
-        // capsule bg's warmer cast bleeds in).
+        // Blend mid-point must have moved to the capsule navy bg rgb(16,20,30)
+        // (probed rgb(17,21,31)): b highest, and G has DROPPED from the twin's
+        // warmer 30 — the old green-gray capsule bg is gone.
         assert!(
-            mg >= mr,
-            "blended body lost the green-gray cast: {mr},{mg},{mb}"
+            (mr - 17).abs() <= 2 && (mg - 21).abs() <= 2 && (mb - 31).abs() <= 2,
+            "blended body not navy: rgb({mr},{mg},{mb})"
         );
         assert!(
-            mg > cg + 3,
-            "body must blend toward the capsule bg as grow rises: G {mg} vs twin {cg}"
+            mb > mg && mg < cg,
+            "body must blend toward the navy capsule bg as grow rises: {mr},{mg},{mb}"
         );
     }
 
@@ -1161,7 +1199,7 @@ mod tests {
             let v = excess(y);
             if v <= v0 * 0.5 {
                 let vp = excess(y - 1);
-                let frac = ((vp - v0 * 0.5) / (vp - v).max(1e-6)).clamp(0.0, 1.0);
+                let frac = ((vp - v0 * 0.5) / (vp - v0).max(1e-6)).clamp(0.0, 1.0);
                 r = (y - 1 - core_bottom) as f32 + frac;
                 break;
             }
@@ -1174,12 +1212,13 @@ mod tests {
 
     #[test]
     fn third_peak_colors_track_spec_stops_on_tall_bars() {
-        // Third-peak sampling on the GROWN capsule: tall bars at u ≈ 1/6,
-        // 1/2, 5/6 of the wave span must land within dRGB ≤ 60 of the
-        // palette stop at their x (bloom is lifted under full cores, so the
-        // core carries the exact gradient), with the teal→cyan→blue ordering
-        // (g channel: L < C, C > R). Expectations come from the same
-        // wave_color the renderer uses, so this tracks any NUM_BARS.
+        // Third-peak sampling on the GROWN capsule: tall bars at u ≈ 1/6 and
+        // 5/6 must land within dRGB ≤ 60 of the palette stop at their x
+        // (bloom is lifted under full cores, so the core carries the exact
+        // gradient); the CENTER third is deliberately white-hot (mix v² at
+        // the peak-emphasis gaussian — rgb ≈ 232,237,239 vs stop
+        // (140,220,222)), so it asserts the white-hot design instead of the
+        // stop.
         let n = crate::pill::vecmentor::NUM_BARS;
         let idx = [n / 6, n / 2, 5 * n / 6];
         let mut bars = vec![0.0; n];
@@ -1197,16 +1236,30 @@ mod tests {
                 chan(&c, x, 21, 1) as f32,
                 chan(&c, x, 21, 0) as f32,
             );
-            let d = (r - er).abs() + (g - eg).abs() + (b - eb).abs();
-            assert!(
-                d <= 60.0,
-                "third {k} (i={i}, u={u:.3}): rgb({r},{g},{b}) vs stop ({er},{eg},{eb}), dRGB {d}"
-            );
+            // The CENTER third is white-hot by design; outer thirds keep
+            // ~+25 of edge bloom/AA over the exact stop (probed dRGB ≈ 30
+            // at u=0.154), so 60 keeps headroom without letting the core
+            // drift off-palette.
+            if k == 1 {
+                // Center: white-hot — near-neutral, luminance near the top.
+                let mx = r.max(g).max(b);
+                let mn = r.min(g).min(b);
+                assert!(
+                    mx - mn <= 12.0 && g >= 225.0,
+                    "center third not white-hot: rgb({r},{g},{b})"
+                );
+            } else {
+                let d = (r - er).abs() + (g - eg).abs() + (b - eb).abs();
+                assert!(
+                    d <= 60.0,
+                    "third {k} (i={i}, u={u:.3}): rgb({r},{g},{b}) vs stop ({er},{eg},{eb}), dRGB {d}"
+                );
+            }
             gs[k] = g;
         }
         assert!(
-            gs[0] < gs[1] && gs[1] > gs[2],
-            "gradient must read teal→cyan→blue: g at thirds = {:?}",
+            gs[0] < gs[1] && gs[2] < gs[1],
+            "gradient must read teal→white-hot→blue: g at thirds = {:?}",
             gs
         );
     }

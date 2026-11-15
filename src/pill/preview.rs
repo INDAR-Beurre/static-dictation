@@ -13,7 +13,7 @@
 //!   never a blank frame)
 //!
 //! NOTE: the entrance spring here mirrors the one live in `tsar.rs`
-//! (semi-implicit Euler, ωn=21 rad/s, ζ=0.28, initial kick 3.2, ceiling 1.25;
+//! (semi-implicit Euler, ωn=21 rad/s, ζ=0.45, initial kick 4.6, ceiling 1.12;
 //! private there — keep the values in sync). `tsar.rs` is the source of
 //! truth for the real animation; this preview only mirrors its constants so
 //! offline flipbooks look like the real thing.
@@ -31,7 +31,7 @@ use std::f32::consts::PI;
 use std::fs;
 use std::path::PathBuf;
 
-use super::canvas::{render_pill, GROW_MAX, SURF_H, SURF_W};
+use super::canvas::{render_pill, SURF_H, SURF_W};
 use super::vecmentor::{NUM_BARS, SHAPE_MASK};
 
 const SCALE: u32 = 2;
@@ -39,10 +39,14 @@ const FPS: f32 = 30.0;
 const DT: f32 = 1.0 / FPS;
 
 /// Entrance-spring constants, mirrored from tsar.rs (SPRING_OMEGA_SHOW,
-/// SPRING_ZETA_SHOW, SPRING_KICK — private there; see module doc).
+/// SPRING_ZETA_SHOW, SPRING_KICK, GROW_CEIL_SHOW — private there; see module
+/// doc).
 const OMEGA: f32 = 21.0;
-const ZETA: f32 = 0.28;
-const KICK: f32 = 3.2;
+const ZETA: f32 = 0.45;
+const KICK: f32 = 4.6;
+/// Effective show-overshoot ceiling, mirrored from tsar.rs (GROW_CEIL_SHOW).
+/// canvas.rs still clamps at 1.25 — GROW_CEIL_SHOW is always inside it.
+const GROW_CEIL: f32 = 1.12;
 /// Hide-contraction spring constants, mirrored from tsar.rs (SPRING_OMEGA_HIDE,
 /// SPRING_ZETA_HIDE — private there; a firmer near-critically-damped shrink,
 /// no overshoot, reaches < 0.02 in 12 ticks ≈ 192 ms).
@@ -81,15 +85,15 @@ fn idle_bars() -> [f32; NUM_BARS] {
 fn story() -> Vec<Story> {
     let mut out = Vec::with_capacity(70);
 
-    // Entrance (frames 0..18): kicked spring grow 0→1 with overshoot to the
-    // 1.25 ceiling, second wiggle, then settled at 1.0 well before speech
-    // starts; alpha ramps 0→1 over the first 4 frames. Grow mirrors tsar's
-    // clamp to [0, 1.25].
+    // Entrance (frames 0..18): kicked spring grow 0→1 with one firm ~+12%
+    // overshoot to the 1.12 ceiling, a faint second wiggle, then settled at
+    // 1.0 well before speech starts; alpha ramps 0→1 over the first 4
+    // frames. Grow mirrors tsar's clamp to [0, 1.12].
     let (mut grow, mut gv) = (0.0f32, KICK);
     for f in 0..18u32 {
         spring_step(&mut grow, &mut gv, 1.0, OMEGA, ZETA, DT);
         let alpha = ((f + 1) as f32 / 4.0).min(1.0);
-        grow = grow.clamp(0.0, GROW_MAX);
+        grow = grow.clamp(0.0, GROW_CEIL);
         out.push(Story {
             grow,
             alpha,

@@ -52,6 +52,7 @@ fn main() {
     let audio = capture::start().expect("no microphone available");
     let mut vad = vad::Vad::new();
     let mut ep = endpoint::EndPointer::new(SILENCE_MS);
+    let mut band_analyzer = bands::Analyzer::new();
     let mut recording = false; // PTT held or toggle-mode ON
     let mut seen_voice = false;
     let mut utterance: Vec<f32> = Vec::new();
@@ -79,7 +80,7 @@ fn main() {
                 if let Some(p) = &pill {
                     let rms =
                         (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
-                    let bands = bands::energies(&frame);
+                    let bands = band_analyzer.energies(&frame);
                     p.update(rms, &bands, voice);
                 }
                 if ep.push(voice) == Decision::End {

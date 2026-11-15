@@ -32,11 +32,11 @@
 //!    30 Hz). The overshoot IS the bounce; no linear-lerp snapping.
 //! 4. EDGE LAG: bars near the edges react slightly slower; motion spreads
 //!    outward from the center organically.
-//! 5. IDLE: when silent, a slow (~1.2 s period) CENTER-EMPHASIZED breathing
-//!    wave + gentle per-bar LFO wobble (±10%) breathe in over ~0.7 s. The
-//!    traveling wave keeps a raised trough (never fully dark), so the resting
-//!    state reads as a neat centered row of small dots — the Siri shimmer —
-//!    not random noise.
+//! 5. IDLE: when silent, the body poses the reference silhouette —
+//!    `idle_pose·SHAPE_MASK + (1−idle_pose)·` a slow (≥1.5 s period)
+//!    center-weighted traveling wave with gentle per-bar LFO wobble (±10%) —
+//!    ramping in over ~0.7 s. The pose carries dim outer dots, a ramp, a dip
+//!    and the tall center cluster; the residual wave keeps it breathing.
 //! 6. SPATIAL ENVELOPE: the whole per-bar SPEECH target (band bloom and
 //!    broadband level alike) is scaled by 1 - 0.72·distance from center, then
 //!    by a static 27-bar SHAPE MASK measured from the reference silhouette —
@@ -45,8 +45,8 @@
 //!    dominating the center.
 //!    (Symmetry is preserved: bar i's mask value mirrors bar NUM_BARS-1-i's; the
 //!    reference's left-right asymmetry is a lighting trick, not physics.)
-//! 7. IDLE UNAFFECTED: the mask gates speech energy only. The resting state
-//!    stays the round-1 traveling-wave dot row (IDLE_TROUGH behavior).
+//! 7. SPEECH-ONLY MASK: the shape mask poses the idle body directly and
+//!    gates speech energy only.
 
 /// Number of equalizer bars (symmetric: bar i mirrors bar NUM_BARS-1-i).
 pub const NUM_BARS: usize = 27;
@@ -98,7 +98,7 @@ pub struct WaveParams {
     pub pair_jitter: f32,
     /// Idle traveling-wave amplitude (0..1 bar height). 0.18 → idle crests
     /// reach ~0.18 at the center; troughs stay at ~0.65 of that: a small,
-    /// always-visible centered dot row.
+    /// always-visible centered dot row (before the pose blend).
     pub idle_amp: f32,
     /// Pushes of silence before the idle wave is fully gated in (21 ≈ 0.7 s).
     pub idle_gate_pushes: u32,
@@ -106,6 +106,9 @@ pub struct WaveParams {
     /// idle body almost immediately; the spring supplies all the smoothing.
     pub idle_blend: f32,
     /// Phase shift between adjacent bars in the idle traveling wave (rad).
+    /// 0.4 → one readable ripple crosses all 27 bars (27·0.4 ≈ 10.8 rad ≈
+    /// 1.7 wavelengths) instead of the old 1.1 (≈ 4.7 wavelengths of
+    /// incoherent shimmer).
     pub idle_phase_step: f32,
     /// Idle phase advance per push (rad). 0.175 → wave period 2π/0.175 ≈ 36
     /// pushes ≈ 1.2 s: slow, subtle breathing.
@@ -113,7 +116,14 @@ pub struct WaveParams {
     /// Per-bar LFO wobble amplitude (± fraction, e.g. 0.10 = ±10%).
     pub wobble_amp: f32,
     /// Per-bar wobble base rate (rad per push); bar i uses rate + 0.05 * i.
+    /// 0.1 → bar 26 wobbles at (0.1+1.3)/2π ≈ 0.22 Hz; base bar at ~1.6 s
+    /// period. Calm breathing, not the old 0.4's 2–4 Hz flicker.
     pub wobble_rate: f32,
+    /// How strongly the silent hold poses the reference silhouette:
+    /// 0.8 → idle body = 0.8·SHAPE_MASK + 0.2·old traveling wave. The
+    /// reference's idle look IS the pose (dim outer dots, ramp, dip, tall
+    /// center cluster); the residual wave keeps it breathing.
+    pub idle_pose: f32,
 }
 
 /// All tuning constants in one place, chosen for the production look.
@@ -143,10 +153,11 @@ pub fn wave_params() -> WaveParams {
         idle_amp: 0.18,
         idle_gate_pushes: 21,
         idle_blend: 0.9,
-        idle_phase_step: 1.1,
+        idle_phase_step: 0.4,
         idle_rate: 0.175,
         wobble_amp: 0.1,
-        wobble_rate: 0.4,
+        wobble_rate: 0.1,
+        idle_pose: 0.8,
     }
 }
 
@@ -328,19 +339,20 @@ impl Sim {
             let mask = 1.0 - speech_gate * (1.0 - SHAPE_MASK[i]);
             let mut target = band_env.max(level_term).clamp(0.0, 1.0) * spatial * mask;
 
-            // Idle breathing: traveling sine + per-bar LFO wobble, gated in on
-            // silence (wobble belongs to the idle look, not to speech). The
-            // body is center-weighted via `spatial` and keeps a raised trough
-            // (IDLE_TROUGH) so the resting silhouette is a dot row, not gaps.
+            // Idle breathing: the body poses the reference silhouette —
+            // idle_pose·SHAPE_MASK floored by the residual wave — plus the
+            // wave itself at the remaining weight, center-weighted via
+            // `spatial`, gated in on silence. The wave's raised trough
+            // (IDLE_TROUGH) keeps the mix from dipping dark between breaths.
             if idle_gate > 0.0 {
                 self.wobble_phase[i] = (self.wobble_phase[i] + p.wobble_rate + 0.05 * i as f32)
                     % core::f32::consts::TAU;
                 let wobble = 1.0 + p.wobble_amp * self.wobble_phase[i].sin();
                 let wave = self.idle_phase - j as f32 * p.idle_phase_step;
-                let body = (p.idle_amp
-                    * (IDLE_TROUGH + (1.0 - IDLE_TROUGH) * wave.sin())
-                    * wobble
-                    * spatial)
+                let breath = IDLE_TROUGH + (1.0 - IDLE_TROUGH) * wave.sin();
+                let wave_body = p.idle_amp * breath * wobble * spatial;
+                let body = (p.idle_pose * SHAPE_MASK[i].max(wave_body)
+                    + (1.0 - p.idle_pose) * wave_body)
                     .clamp(0.0, 1.0);
                 target += (body - target) * (idle_gate * p.idle_blend);
             }
@@ -560,44 +572,57 @@ mod tests {
     }
 
     #[test]
-    fn silence_decays_to_idle_range() {
+    fn silence_converges_to_idle_pose() {
         let mut sim = Sim::new(wave_params());
         let bands = [0.9f32; NUM_BARS];
         for _ in 0..30 {
             sim.push(1.8, &bands, true);
         }
-        let loud: f32 = sim.bars().iter().sum();
         for _ in 0..90 {
             sim.push(0.0, &[0.0; NUM_BARS], false);
         }
-        let quiet: f32 = sim.bars().iter().sum();
-        // Per-BAR mean comparison: a bar-count change rescales both sums, so
-        // the decay ratio is asserted on the mean (idle dots must sit well
-        // below speech levels bar-for-bar).
-        let (loud_mean, quiet_mean) = (loud / NUM_BARS as f32, quiet / NUM_BARS as f32);
-        assert!(
-            quiet_mean < loud_mean * 0.45,
-            "must decay: loud={loud_mean} quiet={quiet_mean}"
-        );
         let bars = sim.bars();
-        // Converged idle: small breathing dots, well below speech levels.
+        // Converged idle: the posed reference silhouette (idle_pose 0.8 ×
+        // SHAPE_MASK, floored by the residual breath) — tall center cluster,
+        // dim outer dots — not a decayed dot row.
         for &b in bars {
-            assert!(b < 0.25, "idle bar {b} too tall");
-            assert!(b >= 0.0);
+            assert!(b <= 1.0);
         }
         assert!(
-            bars[13] > bars[0] && bars[13] > bars[26],
-            "idle silhouette must stay center-weighted: {bars:?}"
+            bars[13] > 0.6,
+            "idle center cluster must be tall: {}",
+            bars[13]
+        );
+        assert!(
+            bars[0] < 0.3 && bars[26] < 0.3,
+            "idle outer dots must stay dim: {bars:?}"
+        );
+        // Pose ordering: the dip must sit well below the cluster.
+        assert!(
+            bars[6] < bars[13] * 0.5,
+            "idle dip must sit below the cluster: {bars:?}"
+        );
+        // Settled: the pose is stable, not chasing noise. Over 15 pushes
+        // (0.5 s) the center moves only with the slow breath, not per-frame.
+        let first = bars[13];
+        let mut max_drift = 0.0f32;
+        for _ in 0..15 {
+            sim.push(0.0, &[0.0; NUM_BARS], false);
+            max_drift = max_drift.max((sim.bars()[13] - first).abs());
+        }
+        assert!(
+            max_drift < 0.1,
+            "idle pose must be calm, drift {max_drift:.3}"
         );
     }
 
     #[test]
-    fn idle_center_dot_row_breathes() {
+    fn idle_posed_center_breathes() {
         let mut sim = Sim::new(wave_params());
-        // Warm up past the spring run-in: bars start at 0.0, so the first
-        // pushes read artificially dark before the row converges to its
-        // breathing steady state (which is what this test judges).
-        for _ in 0..12 {
+        // Warm up past the spring run-in and idle gate: bars start at 0.0, so
+        // the first pushes read artificially dark before the row converges to
+        // its posed breathing steady state (which is what this test judges).
+        for _ in 0..30 {
             sim.push(0.0, &[0.0; NUM_BARS], false);
         }
         // Watch one full breathing cycle window (plus margin).
@@ -612,25 +637,37 @@ mod tests {
             sum_center += c;
         }
         let mean = sum_center / 120.0;
-        // Small centered dot row: never dark, never tall, Siri-shimmer sized.
+        // Posed center: the mask-floored cluster sits tall and steady —
+        // never dark. Its breathing is subtle by design (mask 1.0 floors
+        // the wave); the visible breath lives in the low-mask dip zone,
+        // asserted on bar 6 below.
         assert!(
-            min_center > 0.03 && max_center < 0.2,
-            "center dot out of dot range: min {min_center:.3} max {max_center:.3}"
+            min_center > 0.5 && max_center <= 1.0,
+            "posed center out of range: min {min_center:.3} max {max_center:.3}"
         );
         assert!(
-            (0.07..=0.18).contains(&mean),
-            "mean idle center {mean:.3} outside dot band"
+            (0.7..=1.0).contains(&mean),
+            "mean idle center {mean:.3} outside posed cluster band"
         );
+        // Slow calm breathing in the dip zone: bar 6 (mask 0.08) rides the
+        // residual wave; with the slow rates it must swing visibly but
+        // gently (well under the old full-height flicker).
+        let mut min_dip = 1.0f32;
+        let mut max_dip = 0.0f32;
+        for _ in 0..120 {
+            sim.push(0.0, &[0.0; NUM_BARS], false);
+            let d = sim.bars()[6];
+            min_dip = min_dip.min(d);
+            max_dip = max_dip.max(d);
+        }
         assert!(
-            max_center - min_center > 0.04,
-            "idle must breathe over time: min {min_center:.3} max {max_center:.3}"
+            max_dip - min_dip > 0.02 && max_dip < 0.35,
+            "idle dip must breathe gently: min {min_dip:.3} max {max_dip:.3}"
         );
-        // Center-weighted on average: the traveling wave lets an edge crest
-        // pass the center trough for single frames, so dominance is asserted
-        // on the cycle mean, not per-frame.
+        // Center-weighted on average: the pose dominates the dim edge dots.
         let mut sum_edge = 0.0f32;
         let mut sim2 = Sim::new(wave_params());
-        for _ in 0..12 {
+        for _ in 0..30 {
             sim2.push(0.0, &[0.0; NUM_BARS], false);
         }
         for _ in 0..120 {
@@ -639,8 +676,8 @@ mod tests {
             sum_edge += bars[0].max(bars[26]);
         }
         assert!(
-            mean > sum_edge / 120.0,
-            "idle must stay center-weighted on average: {mean:.3} vs edge {:.3}",
+            mean > sum_edge / 120.0 * 3.0,
+            "posed cluster must dominate edge dots on average: {mean:.3} vs edge {:.3}",
             sum_edge / 120.0
         );
     }
