@@ -1,4 +1,4 @@
-//! Global hotkey listener: evdev (RightCtrl PTT, KP0 toggle, AltGr+L toggle) with stdin fallback.
+//! Global hotkey listener: evdev (AltGr+L = dictation toggle, the ONLY shortcut) with stdin fallback.
 
 use anyhow::Result;
 use std::fs::File;
@@ -8,16 +8,12 @@ use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum HotkeyEvent {
-    PttDown,
-    PttUp,
+    /// The one and only action this tool has.
     Toggle,
 }
 
 /// key codes (values from linux/input-event-codes.h, NOT X keycodes: X = kernel + 8)
 const KEY_L: u16 = 38;
-const KEY_KP0: u16 = 82; // numpad 0 with NumLock on
-const KEY_INSERT: u16 = 110; // NumLock off sends KP0 as KEY_INSERT — alias to keep the toggle alive
-const KEY_RIGHTCTRL: u16 = 97;
 const KEY_RIGHTALT: u16 = 100; // AltGr on most layouts
 
 const EV_KEY: u16 = 0x01;
@@ -131,19 +127,17 @@ impl Drop for UinputKbd {
 }
 
 /// Keyboard state shared by ALL device watchers: a grab-and-re-emit chain
-/// (keyd → handy clones → compositor) can deliver Super on one /dev/input node
-/// and D on another; per-device state would split the combo. Shared also makes
-/// the cross-node debounce swallow handy's duplicated physical presses, and
-/// means a meta keyup seen by ANY watcher clears the hold for everyone.
-/// Keyboard state shared by ALL device watchers: a grab-and-re-emit chain
-/// (keyd → handy clones → compositor) can deliver Super on one /dev/input node
-/// and D on another; per-device state would split the combo. Shared also makes
-/// the cross-node debounce swallow handy's duplicated physical presses, and
-/// means a modifier keyup seen by ANY watcher clears the hold for everyone.
+/// (keyd → handy clones → compositor) can deliver AltGr on one /dev/input node
+/// and L on another; per-device state would split the combo. Shared also makes
+/// the cross-node debounce collapse duplicated physical presses, and means a
+/// modifier keyup seen by ANY watcher clears the hold for everyone.
 struct KeyState {
+    /// AltGr stays held until its own keyup, even after the chord fires — that
+    /// is what stops a second L tap while AltGr is down from typing "l".
     modifier_held: bool,
-    last_ptt_down: Option<Instant>,
-    last_ptt_up: Option<Instant>,
+    chord_fired: bool,
+    /// True after AltGr+L fired until the matching AltGr release is swallowed.
+    chord_consumed: bool,
     last_toggle: Option<Instant>,
     last_event: Instant, // any tracked stream activity, for the stale-hold safety
 }
@@ -152,27 +146,38 @@ impl KeyState {
     fn new() -> Self {
         KeyState {
             modifier_held: false,
-            last_ptt_down: None,
-            last_ptt_up: None,
+            chord_fired: false,
+            chord_consumed: false,
             last_toggle: None,
             last_event: Instant::now(),
         }
     }
 }
 
+/// Build a synthetic EV_KEY event. Used to cancel the AltGr press we already
+/// re-emitted, so the chord leaves no modifier state in the focused app.
+fn synthetic_key(code: u16, value: i32) -> [u8; EVENT_SIZE] {
+    let mut b = [0u8; EVENT_SIZE];
+    b[16..18].copy_from_slice(&EV_KEY.to_ne_bytes());
+    b[18..20].copy_from_slice(&code.to_ne_bytes());
+    b[20..24].copy_from_slice(&value.to_ne_bytes());
+    b
+}
+
+/// Any L press/repeat/release while AltGr is down belongs to the chord and must
+/// never be re-emitted; otherwise holding AltGr and tapping L twice types "l".
+fn l_event_hidden(value: u8, modifier_held: bool) -> bool {
+    matches!(value, 0..=2) && modifier_held
+}
+
 /// Tracked keys, for the startup/keypress log line that makes recognition visible.
 fn tracked(code: u16) -> bool {
-    matches!(
-        code,
-        KEY_L | KEY_KP0 | KEY_INSERT | KEY_RIGHTCTRL | KEY_RIGHTALT
-    )
+    matches!(code, KEY_L | KEY_RIGHTALT)
 }
 
 fn key_name(code: u16) -> &'static str {
     match code {
         KEY_L => "L",
-        KEY_KP0 | KEY_INSERT => "KP0/INSERT",
-        KEY_RIGHTCTRL => "RIGHTCTRL",
         KEY_RIGHTALT => "RIGHTALT",
         _ => "?",
     }
@@ -219,41 +224,41 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
     // safety: a missed AltGr keyup (streams out of sync across watchers, or the
     // press is consumed by a remapper like keyd) would leave the hold stuck ON
     // forever, so a later plain L would toggle. If events went quiet for
-    // MODIFIER_IDLE_RESET, the hold is stale.
-    if state.modifier_held && state.last_event.elapsed() >= MODIFIER_IDLE_RESET {
+    // MODIFIER_IDLE_RESET, the hold and the pending chord consumption are stale.
+    if (state.modifier_held || state.chord_consumed)
+        && state.last_event.elapsed() >= MODIFIER_IDLE_RESET
+    {
         state.modifier_held = false;
+        state.chord_fired = false;
+        state.chord_consumed = false;
     }
     state.last_event = Instant::now();
     match value {
         0 => {
-            // release: any watcher seeing a meta keyup clears the shared hold
-            if code == KEY_RIGHTCTRL && state.past(&state.last_ptt_up) {
-                state.last_ptt_up = Some(Instant::now());
-                return Some(HotkeyEvent::PttUp);
-            }
+            // release: any watcher seeing the AltGr keyup clears the shared hold
             if code == KEY_RIGHTALT {
                 state.modifier_held = false;
+                state.chord_fired = false;
             }
             None
         }
         1 => {
-            // press
+            // press — the only binding in the whole tool is AltGr+L
             match code {
-                KEY_RIGHTCTRL if state.past(&state.last_ptt_down) => {
-                    state.last_ptt_down = Some(Instant::now());
-                    Some(HotkeyEvent::PttDown)
-                }
-                KEY_KP0 | KEY_INSERT if state.past(&state.last_toggle) => {
-                    state.last_toggle = Some(Instant::now());
-                    Some(HotkeyEvent::Toggle)
-                }
-                KEY_L if state.modifier_held && state.past(&state.last_toggle) => {
-                    state.modifier_held = false; // consume AltGr+L, ignore stray L until next tap
+                KEY_L
+                    if state.modifier_held
+                        && !state.chord_fired
+                        && state.past(&state.last_toggle) =>
+                {
+                    state.chord_fired = true; // exactly one toggle per AltGr hold
+                    state.chord_consumed = true; // hide the matching AltGr release too
                     state.last_toggle = Some(Instant::now());
                     Some(HotkeyEvent::Toggle)
                 }
                 KEY_RIGHTALT => {
                     state.modifier_held = true;
+                    state.chord_fired = false;
+                    state.chord_consumed = false;
                     None
                 }
                 _ => None,
@@ -263,21 +268,15 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
     }
 }
 
-/// Per-kind debounce for the stdin path, mirroring the evdev windows: a burst of
-/// the same event inside DEBOUNCE collapses to one, while distinct lines spaced
-/// ≥ DEBOUNCE apart all pass.
-fn stdin_allowed(st: &mut KeyState, ev: &HotkeyEvent) -> bool {
-    let slot = match ev {
-        HotkeyEvent::PttDown => &mut st.last_ptt_down,
-        HotkeyEvent::PttUp => &mut st.last_ptt_up,
-        HotkeyEvent::Toggle => &mut st.last_toggle,
-    };
-    let ok = match slot {
+/// Debounce for the stdin path, mirroring the evdev window: a burst inside
+/// DEBOUNCE collapses to one toggle.
+fn stdin_allowed(st: &mut KeyState) -> bool {
+    let ok = match st.last_toggle {
         Some(t) => t.elapsed() >= DEBOUNCE,
         None => true,
     };
     if ok {
-        *slot = Some(Instant::now());
+        st.last_toggle = Some(Instant::now());
     }
     ok
 }
@@ -322,7 +321,6 @@ fn watch_file(
     let short = path.rsplit('/').next().unwrap_or(&path).to_string();
     Some(std::thread::spawn(move || {
         let mut buf = [0u8; EVENT_SIZE];
-        let mut l_swallowed = false; // L press that fired the toggle; repeats/release also hidden
         'watch: loop {
             match file.read_exact(&mut buf) {
                 Ok(()) => {
@@ -340,22 +338,32 @@ fn watch_file(
                         }
                         // never hold the state lock across eprintln/send: a closed
                         // stderr panics eprintln and would poison the shared mutex
-                        let hit = {
+                        // The chord must do ONE thing: toggle dictation. It must not
+                        // type "l", leave a held AltGr modifier, or trigger any other
+                        // app binding. L press/repeat/release are swallowed; the AltGr
+                        // press we already re-emitted is cancelled with a synthetic
+                        // release, and the real keyup is swallowed too.
+                        // shortcut: cancelling AltGr early means a second level-3 key
+                        // pressed while AltGr is still physically held types its base
+                        // character; upgrade by buffering the AltGr press if needed.
+                        let (hit, hide_altgr_release, hide_l) = {
                             let mut st = state.lock().unwrap();
-                            decide(&mut st, code, value as u8)
+                            let hit = decide(&mut st, code, value as u8);
+                            let hide = code == KEY_RIGHTALT && value == 0 && st.chord_consumed;
+                            if hide {
+                                st.chord_consumed = false;
+                            }
+                            (
+                                hit,
+                                hide,
+                                code == KEY_L && l_event_hidden(value as u8, st.modifier_held),
+                            )
                         };
-                        // while grabbed, hide the AltGr+L keystroke (and its autorepeats) so
-                        // "l" never reaches the focused window; a plain L is forwarded untouched
-                        let mut swallow = false;
-                        if grabbed && code == KEY_L {
-                            if value == 1 && hit == Some(HotkeyEvent::Toggle) {
-                                l_swallowed = true;
-                                swallow = true;
-                            } else if (value == 2 || value == 0) && l_swallowed {
-                                swallow = true;
-                                if value == 0 {
-                                    l_swallowed = false; // L is free again after the release
-                                }
+                        let swallow = hide_altgr_release || hide_l;
+                        let cancel_altgr = grabbed && hit == Some(HotkeyEvent::Toggle);
+                        if cancel_altgr {
+                            if let Some(dev) = uinput.lock().unwrap().as_mut() {
+                                dev.emit(&synthetic_key(KEY_RIGHTALT, 0));
                             }
                         }
                         if !swallow {
@@ -407,7 +415,7 @@ fn watch_file(
 }
 
 fn stdin_fallback(tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
-    eprintln!("hk: no readable /dev/input/event* — stdin fallback: empty line or \"start\" = start, \"stop\" = stop, \"toggle\" = toggle, \"quit\" = exit");
+    eprintln!("hk: no readable /dev/input/event* — stdin fallback: empty line or \"toggle\" = toggle dictation, \"quit\" = exit");
     let mut line = String::new();
     let mut st = KeyState::new(); // same per-kind debounce windows as the evdev path
     loop {
@@ -418,14 +426,12 @@ fn stdin_fallback(tx: &crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
         }
         let t = line.trim_end_matches(['\n', '\r']).trim();
         let ev = match t {
-            "" | "start" => Some(HotkeyEvent::PttDown),
-            "stop" => Some(HotkeyEvent::PttUp),
-            "toggle" => Some(HotkeyEvent::Toggle),
+            "" | "toggle" => Some(HotkeyEvent::Toggle),
             "quit" => return Ok(()),
             _ => None,
         };
         if let Some(ev) = ev {
-            if stdin_allowed(&mut st, &ev) {
+            if stdin_allowed(&mut st) {
                 tx.send(ev)?;
             }
         }
@@ -474,7 +480,7 @@ pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
             }
         }
         if new_watchers > 0 {
-            eprintln!("hk: {armed} input nodes armed (AltGr+L / NumPad0 = toggle dictation, hold RightCtrl = push-to-talk)");
+            eprintln!("hk: {armed} input nodes armed (AltGr+L = dictation; no other hotkey)");
         }
         if first_scan {
             if found == 0 {
@@ -495,18 +501,17 @@ mod tests {
         KeyState::new()
     }
 
+    /// linux/input-event-codes.h: 97 = KEY_RIGHTCTRL, 82 = KEY_KP0,
+    /// 110 = KEY_INSERT (NumLock-off KP0). None may produce an action.
     #[test]
-    fn rightctrl_ptt() {
+    fn only_altgr_l_is_bound() {
         let mut s = state();
-        assert_eq!(decide(&mut s, KEY_RIGHTCTRL, 1), Some(HotkeyEvent::PttDown));
-        assert_eq!(decide(&mut s, KEY_RIGHTCTRL, 0), Some(HotkeyEvent::PttUp));
-    }
-
-    #[test]
-    fn kp0_toggles() {
-        let mut s = state();
-        assert_eq!(decide(&mut s, KEY_KP0, 1), Some(HotkeyEvent::Toggle));
-        assert_eq!(decide(&mut s, KEY_KP0, 1), None); // second tap inside debounce window ignored
+        for code in [97, 82, 110] {
+            assert_eq!(decide(&mut s, code, 1), None, "key {code} must be inert");
+            assert_eq!(decide(&mut s, code, 0), None, "key {code} must be inert");
+        }
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
+        assert_eq!(decide(&mut s, KEY_L, 1), Some(HotkeyEvent::Toggle));
     }
 
     #[test]
@@ -516,11 +521,14 @@ mod tests {
     }
 
     #[test]
-    fn altgr_l_toggles() {
+    fn altgr_l_toggles_once_per_hold() {
         let mut s = state();
         assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
         assert_eq!(decide(&mut s, KEY_L, 1), Some(HotkeyEvent::Toggle));
-        assert!(!s.modifier_held); // consumed with the toggle, no leak
+        assert_eq!(decide(&mut s, KEY_L, 0), None);
+        assert_eq!(decide(&mut s, KEY_L, 1), None); // a 2nd tap must NOT toggle or type
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 0), None);
+        assert!(!s.modifier_held); // no stuck hold after keyup
     }
 
     #[test]
@@ -544,65 +552,40 @@ mod tests {
     #[test]
     fn stdin_debounce_collapses_bursts() {
         let mut s = state();
-        assert!(stdin_allowed(&mut s, &HotkeyEvent::Toggle));
-        assert!(!stdin_allowed(&mut s, &HotkeyEvent::Toggle)); // sub-window repeat swallowed
-        assert!(stdin_allowed(&mut s, &HotkeyEvent::PttDown)); // other kind unaffected
+        assert!(stdin_allowed(&mut s));
+        assert!(!stdin_allowed(&mut s)); // sub-window repeat swallowed
         std::thread::sleep(DEBOUNCE + Duration::from_millis(30));
-        assert!(stdin_allowed(&mut s, &HotkeyEvent::Toggle)); // a distinct line after the window passes
+        assert!(stdin_allowed(&mut s)); // a distinct line after the window passes
     }
 
-    /// The swallow rule in watch_file: AltGr+L hides press/repeat/release of L
-    /// from the uinput re-emit, plain L passes through untouched.
     #[test]
-    fn altgr_l_swallow_only_when_toggled() {
+    fn chord_marks_altgr_release_for_swallowing() {
         let mut s = state();
-        let mut l_swallowed = false;
-        let swallow = |l_swallowed: &mut bool, value: u8, hit: Option<HotkeyEvent>| -> bool {
-            let mut sw = false;
-            if value == 1 && hit == Some(HotkeyEvent::Toggle) {
-                *l_swallowed = true;
-                sw = true;
-            } else if (value == 2 || value == 0) && *l_swallowed {
-                sw = true;
-                if value == 0 {
-                    *l_swallowed = false;
-                }
-            }
-            let _ = s;
-            sw
-        };
-
-        // plain L (no AltGr): press/repeat/release all forwarded
-        let hit = decide(&mut s, KEY_L, 1);
-        assert_eq!(hit, None);
-        assert!(!swallow(&mut l_swallowed, 1, hit.clone()));
-        assert!(!swallow(&mut l_swallowed, 2, hit.clone()));
-        assert!(!swallow(&mut l_swallowed, 0, hit));
-
-        // AltGr+L: press swallowed, autorepeat swallowed, release swallowed and frees L
         assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
-        let hit = decide(&mut s, KEY_L, 1);
-        assert_eq!(hit, Some(HotkeyEvent::Toggle));
-        assert!(swallow(&mut l_swallowed, 1, hit));
-        assert!(swallow(&mut l_swallowed, 2, None)); // repeat hidden
-        assert!(swallow(&mut l_swallowed, 0, None)); // release hidden
-        assert!(!l_swallowed);
-
-        // after the release a fresh plain L is forwarded again
-        let hit = decide(&mut s, KEY_L, 1);
-        assert_eq!(hit, None);
-        assert!(!swallow(&mut l_swallowed, 1, hit));
+        assert_eq!(decide(&mut s, KEY_L, 1), Some(HotkeyEvent::Toggle));
+        assert!(s.chord_consumed); // the real AltGr keyup must not reach apps
+        assert!(s.modifier_held); // held until keyup so no L can leak
     }
-}
 
-#[cfg(test)]
-mod insert_alias_tests {
-    use super::*;
-
+    /// The real watch_file rule: while AltGr is down, EVERY L event is hidden;
+    /// a plain L (and an L after the chord) passes through untouched.
     #[test]
-    fn numlock_off_insert_still_toggles() {
-        let mut s = KeyState::new();
-        assert_eq!(decide(&mut s, KEY_INSERT, 1), Some(HotkeyEvent::Toggle));
-        assert_eq!(decide(&mut s, KEY_INSERT, 1), None); // debounce
+    fn l_events_hidden_only_during_chord() {
+        let mut s = state();
+        for v in [1, 2, 0] {
+            assert!(!l_event_hidden(v, s.modifier_held));
+        }
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
+        for v in [1, 2, 0, 1] {
+            // includes a second tap before AltGr keyup
+            assert!(
+                l_event_hidden(v, s.modifier_held),
+                "L value {v} must be hidden"
+            );
+        }
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 0), None);
+        for v in [1, 2, 0] {
+            assert!(!l_event_hidden(v, s.modifier_held));
+        }
     }
 }

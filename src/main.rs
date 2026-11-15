@@ -1,4 +1,4 @@
-//! static-dictation v1: lightweight push-to-talk / toggle dictation → Groq whisper-large-v3-turbo.
+//! static-dictation v1: lightweight toggle dictation → Groq whisper-large-v3-turbo.
 
 mod bands;
 mod capture;
@@ -51,13 +51,13 @@ fn main() {
         }
     });
 
-    println!("static-dictation v1 — hold RightCtrl to speak (release to transcribe); NumPad0 or AltGr+L toggles continuous dictation");
+    println!("static-dictation v1 — AltGr+L toggles dictation (the only shortcut)");
 
     let audio = capture::start().expect("no microphone available");
     let mut vad = vad::Vad::new();
     let mut ep = endpoint::EndPointer::new(SILENCE_MS);
     let mut band_analyzer = bands::Analyzer::new();
-    let mut recording = false; // PTT held or toggle-mode ON
+    let mut recording = false; // AltGr+L toggles this
     let mut seen_voice = false;
     let mut utterance: Vec<f32> = Vec::new();
     let mut buf: Vec<f32> = Vec::new();
@@ -96,7 +96,7 @@ fn main() {
                 if ep.push(voice) == Decision::End {
                     finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
                     audio.drop_backlog();
-                    // toggle mode keeps going; PTT mode ends when key is released
+                    // dictation keeps going until AltGr+L toggles it off
                 }
             }
         }
@@ -104,18 +104,6 @@ fn main() {
         // Hotkey events.
         while let Ok(ev) = hk_rx.try_recv() {
             match ev {
-                HotkeyEvent::PttDown => {
-                    ep = endpoint::EndPointer::new(SILENCE_MS);
-                    if let Some(p) = &pill {
-                        p.show();
-                    }
-                    recording = true;
-                }
-                HotkeyEvent::PttUp => {
-                    recording = false;
-                    finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
-                    audio.drop_backlog();
-                }
                 HotkeyEvent::Toggle => {
                     eprintln!(
                         "static-dictation: toggle event received (recording={} )",
