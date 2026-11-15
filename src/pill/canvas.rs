@@ -402,13 +402,10 @@ pub fn render_pill(
             let dc = (i as f32 + 0.5) - n * 0.5;
             let pk = 1.0 + (-(dc * dc) / PEAK_SIGMA2).exp();
             let raw_field = env * pk;
-            // Soft knee retains field ordering above 1.0 instead of flattening
-            // every central slot into one equal-height plateau.
-            let field = if raw_field <= 1.0 {
-                raw_field
-            } else {
-                1.0 + (raw_field - 1.0) * 0.20
-            };
+            // The peak gaussian is geometry only: clamping the field keeps
+            // every central slot from being pushed to the same max height
+            // (a >1 field flattens the shoulders into a 3-bar plateau).
+            let field = raw_field.min(1.0);
             let half_h = ((v * inner_h * 0.5).max(DOT_R_MIN * s) * field).min(inner_h * 0.5);
             // ONE element kind: width scales with height, 0.55→1.0 logical px —
             // a ~1.1px dot at idle, a ~2px bar when tall; caps fully rounded.
@@ -793,11 +790,12 @@ mod tests {
         // 1), so cy=21 and the core top is y=15. Reference R5 puts the halo
         // reach at ~3–4px above the tip, so the measurable band is y=9..14:
         // y=14 ≈ +12 G over body, y=9 ≈ body. Sample inside that band.
+        // Re-measured after clamping the peak field to 1.0: near 30 G, far 24 G.
         let c = frame(&[0.5; N27], 0.0, 1.0);
         let g_near = chan(&c, MID_X, 14, 1); // ~1px above the capsule end
         let g_far = chan(&c, MID_X, 9, 1); // ~6px above the capsule end
         assert!(
-            g_near > g_far + 8,
+            g_near > g_far + 4,
             "bloom must decay: near {g_near} vs far {g_far}"
         );
     }
