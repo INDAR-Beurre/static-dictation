@@ -24,7 +24,9 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-mod canvas;
+// canvas is pub(crate) so main.rs's env-gated frame dump (H1) can drive the
+// same offscreen render_pill path preview.rs uses; no behavior change.
+pub(crate) mod canvas;
 mod tsar;
 pub(crate) mod vecmentor;
 

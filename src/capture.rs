@@ -114,6 +114,10 @@ pub fn start() -> Result<AudioIn> {
 }
 
 /// Handle to the capture stream: bounded queue of 16k mono f32 chunks.
+/// Clone: Receiver<Vec<f32>> is cloneable (crossbeam); the harness's frame
+/// dump hook (main.rs) needs a handle clone. Motion agent's one-line bridge
+/// so the shared checkout compiles during round-3 integration.
+#[derive(Clone)]
 pub struct AudioIn {
     rx: Receiver<Vec<f32>>,
 }

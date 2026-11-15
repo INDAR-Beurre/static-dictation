@@ -15,7 +15,8 @@ pub enum HotkeyEvent {
 
 /// key codes (values from linux/input-event-codes.h, NOT X keycodes: X = kernel + 8)
 const KEY_L: u16 = 38;
-const KEY_KP0: u16 = 82; // numpad 0 with NumLock on; NumLock off sends KEY_INSERT
+const KEY_KP0: u16 = 82; // numpad 0 with NumLock on
+const KEY_INSERT: u16 = 110; // NumLock off sends KP0 as KEY_INSERT — alias to keep the toggle alive
 const KEY_RIGHTCTRL: u16 = 97;
 const KEY_RIGHTALT: u16 = 100; // AltGr on most layouts
 
@@ -161,13 +162,16 @@ impl KeyState {
 
 /// Tracked keys, for the startup/keypress log line that makes recognition visible.
 fn tracked(code: u16) -> bool {
-    matches!(code, KEY_L | KEY_KP0 | KEY_RIGHTCTRL | KEY_RIGHTALT)
+    matches!(
+        code,
+        KEY_L | KEY_KP0 | KEY_INSERT | KEY_RIGHTCTRL | KEY_RIGHTALT
+    )
 }
 
 fn key_name(code: u16) -> &'static str {
     match code {
         KEY_L => "L",
-        KEY_KP0 => "KP0",
+        KEY_KP0 | KEY_INSERT => "KP0/INSERT",
         KEY_RIGHTCTRL => "RIGHTCTRL",
         KEY_RIGHTALT => "RIGHTALT",
         _ => "?",
@@ -239,7 +243,7 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
                     state.last_ptt_down = Some(Instant::now());
                     Some(HotkeyEvent::PttDown)
                 }
-                KEY_KP0 if state.past(&state.last_toggle) => {
+                KEY_KP0 | KEY_INSERT if state.past(&state.last_toggle) => {
                     state.last_toggle = Some(Instant::now());
                     Some(HotkeyEvent::Toggle)
                 }
@@ -588,5 +592,17 @@ mod tests {
         let hit = decide(&mut s, KEY_L, 1);
         assert_eq!(hit, None);
         assert!(!swallow(&mut l_swallowed, 1, hit));
+    }
+}
+
+#[cfg(test)]
+mod insert_alias_tests {
+    use super::*;
+
+    #[test]
+    fn numlock_off_insert_still_toggles() {
+        let mut s = KeyState::new();
+        assert_eq!(decide(&mut s, KEY_INSERT, 1), Some(HotkeyEvent::Toggle));
+        assert_eq!(decide(&mut s, KEY_INSERT, 1), None); // debounce
     }
 }

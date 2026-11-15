@@ -10,6 +10,10 @@ mod output;
 mod pill;
 mod vad;
 
+// H1 frame dump (see maybe_spawn call in main): dead weight unless the env
+// flag is set — when it is not, the module's one function returns immediately.
+mod dump;
+
 use crossbeam_channel::unbounded;
 use endpoint::Decision;
 use hk::HotkeyEvent;
@@ -57,6 +61,12 @@ fn main() {
     let mut seen_voice = false;
     let mut utterance: Vec<f32> = Vec::new();
     let mut buf: Vec<f32> = Vec::new();
+
+    // H1 harness hook: STATIC_DICTATION_DUMP_FRAMES=<dir> spawns a headless
+    // frame dumper rendering the pill's real Sim+canvas pipeline offscreen,
+    // writing a PNG every fixed 100 ms wall interval — beats grim's ~0.3
+    // s/shot aliasing. Env unset → nothing starts; zero behavior change.
+    dump::maybe_spawn();
 
     loop {
         // Move any new audio into the local buffer (non-blocking).

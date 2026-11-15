@@ -1,0 +1,29 @@
+static-dictation v1 — hold RightCtrl to speak (release to transcribe); NumPad0 or AltGr+L toggles continuous dictation
+hk: watching /dev/input/event21
+hk: /dev/input/event20 grabbed (AltGr+L will not type into windows)
+hk: watching /dev/input/event20
+hk: watching /dev/input/event19
+hk: watching /dev/input/event18
+hk: watching /dev/input/event17
+hk: watching /dev/input/event16
+hk: watching /dev/input/event15
+hk: watching /dev/input/event14
+hk: watching /dev/input/event13
+hk: watching /dev/input/event12
+hk: watching /dev/input/event11
+hk: watching /dev/input/event10
+hk: /dev/input/event9 grabbed (AltGr+L will not type into windows)
+hk: watching /dev/input/event9
+hk: watching /dev/input/event8
+hk: watching /dev/input/event7
+hk: watching /dev/input/event6
+hk: watching /dev/input/event5
+hk: watching /dev/input/event4
+hk: watching /dev/input/event3
+hk: watching /dev/input/event2
+hk: /dev/input/event1 grabbed (AltGr+L will not type into windows)
+hk: watching /dev/input/event1
+hk: watching /dev/input/event0
+hk: 22 input nodes armed (AltGr+L / NumPad0 = toggle dictation, hold RightCtrl = push-to-talk)
+hk: event20 RIGHTCTRL press
+hk: event20 -> PttDown

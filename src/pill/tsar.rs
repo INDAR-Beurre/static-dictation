@@ -53,7 +53,7 @@
 //! layer.set_anchor(Anchor::TOP);
 //! layer.set_size(320, 64);
 //! layer.set_exclusive_zone(-1);           // ignore the top bar's 32px zone → surface sits at y=0
-//! layer.set_margin(-6, 0, 0, 0);        // top-center, raised 6px: grown core (cy 21) on the clock center (y 15)
+//! layer.set_margin(0, 0, 0, 0);         // grown cap tops out at world y=3 (3px clear of the screen edge)
 //! layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 //! layer.commit();                        // then wait for first configure event
 //! ```
@@ -155,6 +155,9 @@ const SPRING_KICK: f32 = 4.6;
 /// ≈1.12, so this clamp is a guard (the spring only touches it when a mid-Show
 /// Hide retarget hands back extra velocity), not a plateau the entrance rides.
 const GROW_CEIL_SHOW: f32 = 1.12;
+// canvas.rs keeps its own private 1.25 clamp as a defensive bound; this
+// ceiling is strictly inside it, so tsar-side renders can never exceed the
+// canvas geometry's documented 1.25 overshoot envelope.
 
 /// One semi-implicit Euler step of the grow spring toward `target`.
 /// Semi-implicit (a.k.a. symplectic) Euler — update velocity first with the new
@@ -322,16 +325,23 @@ fn render_thread(
     layer.set_size(SURF_W, SURF_H);
     // Exclusive zone −1: Mango ignores the top bar's exclusive zone and lets
     // this overlay sit at y=0. Surface-local core line: canvas puts the
-    // collapsed twin at cy=15 and the grown core at cy=15+6·grow=21. Measured
-    // against the real Mango bar (live-proof/cap-1794694630, scale 1.5): the
-    // clock pill's center is at world y 22.5 phys = 15.0 logical, so surface
-    // top y = −6 puts the GROWN core at 21−6 = 15 = clock center — the capsule
-    // grows out of the clock pill instead of hanging 6 logical px below it.
-    // Side effect: the collapsed twin lands at cy 9 (6 above the clock) for the
-    // first ~2 ticks of a Show — invisible against the 160 ms alpha fade.
+    // collapsed twin at cy=15 and the grown core at cy=15+6·grow=21. Round 3
+    // margin 0 (was −6): the surface top sits AT y=0, so the grown capsule
+    // (half-height 18 at grow=1) tops out at world y = 21−18 = 3 — three
+    // logical px below the screen top, killing the flat-cut top the geometry
+    // critic measured (margin −6 put that top edge at y=−3, sliced by the
+    // screen edge; the y=0 row spanned 87% of max width). Alignment still
+    // reads right: the collapsed twin (cy 15) sits exactly on the clock pill
+    // center (world y 15.0), and the island grows downward out of it — top
+    // edge 3..39 world vs the clock twin 3..27. Bottom edge: grown bottom
+    // 21+18 = 39 logical + shadow (offset 4, span 12, quadratic falloff —
+    // only the first ~3px read) stays above the Mango bar height 44.7
+    // (round-2 measured: bottom 33 world with margin −6; margin 0 shifts
+    // everything +6). Overshoot guard: even at the defensive 1.25 clamp
+    // (height_ease 1.075, hh 18.45) the top edge is 2.55 ≥ 0 — nothing clips.
     // The compositor geometry stays static (per-tick margins would fight Mango).
     layer.set_exclusive_zone(-1);
-    layer.set_margin(-6, 0, 0, 0);
+    layer.set_margin(0, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
 
     // WHY regions: the pill is a floating overlay — it must never eat clicks and
