@@ -27,5 +27,6 @@ hk: watching /dev/input/event0
 hk: 22 input nodes armed (AltGr+L / NumPad0 = toggle dictation, hold RightCtrl = push-to-talk)
 hk: event20 RIGHTCTRL press
 hk: event20 -> PttDown
+I'm going to go.
 hk: event20 RIGHTCTRL release
 hk: event20 -> PttUp

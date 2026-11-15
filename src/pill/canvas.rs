@@ -91,8 +91,8 @@ const AA_BAND: f32 = 1.25;
 // centre saturate without widening the bars past the reference.
 const ELEM_AA: f32 = 0.45;
 const BAR_SPAN_FRAC: f32 = 0.68; // waveform occupies the central span of the pill width
-const DOT_R: f32 = 1.0; // leader-dot radius, logical px (≈2px diameter)
-const DOT_STEP: f32 = 3.7; // leader-dot spacing, logical px (ref pitch 4.0/1.08-scale ≈ 3.7)
+const DOT_R: f32 = 0.55; // ≈2.2px FWHM at the reference's 2× render scale
+const DOT_STEP: f32 = 2.05; // ≈4.1px pitch at the reference's 2× render scale
 const DOT_A: f32 = 255.0; // leader-dot peak alpha — the reference dots are
                           // opaque marks; the whisper ramp carries their dimness.
 const VIS_FLOOR: f32 = 30.0; // C9 visibility floor: a ramped element's excess
@@ -103,7 +103,7 @@ const VIS_FLOOR: f32 = 30.0; // C9 visibility floor: a ramped element's excess
                              // over body ≈32 → +28 excess, ≈13% of the 219
                              // peak excess — the R2 hard-stop fraction).
 const BLUE_BIAS: f32 = 0.3; // right-flank blue weight per unit fpos (bars)
-const DOT_BLUE_BIAS: f32 = 1.6; // stronger blue bias on the leader dots (C8)
+const DOT_BLUE_BIAS: f32 = 2.0; // keeps both endpoint dots blue (B−G ≥ +30)
 const _DOT_A_OLD: f32 = 100.0; // leader-dot peak alpha (≈39% — tails read like the ref)
                                // Leader-zone dimming: brightness falls off toward both ends of the row so the
                                // island reads as a lit center cluster with dim tail dots (reference: tail ramp
@@ -136,8 +136,8 @@ const GLOW_K: f32 = 2.5; // bloom exp kernel at v=1, logical px — two-scaled p
                          // gaps read as gaps.
 const GLOW_REACH: f32 = 18.0; // faint bloom halo cut-off (~18px); at K=2.75 the
                               // cutoff step is ~0.15% of the edge value — dithered away.
-const BLOOM: f32 = 0.5; // additive bloom strength (was 0.85 — the wide kernel is gone)
-const GLOW_TEAL: f32 = 1.15; // glow g/b boost over r — slight teal bias in the halo
+const BLOOM: f32 = 0.28; // keep gap haze below the measured +20 G limit
+const GLOW_TEAL: f32 = 1.05; // restrained halo lift; preserve dark inter-bar gaps
                              // Bloom alpha gain: must stay ≥ max glow channel (255·GLOW_TEAL ≈ 293)
                              // × BLOOM (≈146.5) so the additive step can never push a color channel
                              // above alpha (premultiplied).
@@ -149,7 +149,7 @@ const GLOW_A: f32 = 197.0;
 const GLOW_IDLE: f32 = 0.30;
 // 27 bars at pitch 2·0.68·74/27 ≈ 3.73 logical px (0.68 of the 148px grown
 // pill width) → ~2.7px bar width max.
-const ELEM_R_MAX: f32 = 1.0; // element half-width max → ~2px bars, ~1.7px gaps at pitch
+const ELEM_R_MAX: f32 = 1.2; // element half-width max → ~2.4px bars (ref FWHM 2.7px)
 const DOT_R_MIN: f32 = 0.75; // idle element radius floor → ~1.5px dots. The critique asked
                              // 0.55, but 0.55 starves END dots of sub-pixel coverage (G-delta ≈10
                              // vs body < the +12 visibility bar); 0.75 keeps the ~1.5px dot while the
@@ -401,7 +401,14 @@ pub fn render_pill(
             // the hot-snap threshold sees a clean field.
             let dc = (i as f32 + 0.5) - n * 0.5;
             let pk = 1.0 + (-(dc * dc) / PEAK_SIGMA2).exp();
-            let field = (env * pk).min(1.0);
+            let raw_field = env * pk;
+            // Soft knee retains field ordering above 1.0 instead of flattening
+            // every central slot into one equal-height plateau.
+            let field = if raw_field <= 1.0 {
+                raw_field
+            } else {
+                1.0 + (raw_field - 1.0) * 0.20
+            };
             let half_h = ((v * inner_h * 0.5).max(DOT_R_MIN * s) * field).min(inner_h * 0.5);
             // ONE element kind: width scales with height, 0.55→1.0 logical px —
             // a ~1.1px dot at idle, a ~2px bar when tall; caps fully rounded.
@@ -427,7 +434,9 @@ pub fn render_pill(
             // the 36-dot line), so applying it here would double-dim the
             // flanks below the reference. `field` is already the height
             // factor, so colour brightness stays proportional to height.
-            let dim = field;
+            // The soft knee is geometry-only: colour must stay at/below the
+            // palette stop, otherwise a >1 field overdrives the core to white.
+            let dim = field.min(1.0);
             // C8 tail blue: the right flank's blue channel is weighted up so
             // the tail reads steel-blue (ref mid-height B−G ≈ +8, end dots
             // ≈ +30), while the left flank stays teal.
@@ -487,7 +496,7 @@ pub fn render_pill(
         // out toward each capsule end to hw−15px (C3: ref line span ≈ 79–80%
         // of W with margins ≈ 8% / 12.6%). Every slot renders (C6: no
         // dropouts); the whisper ramp (C9) carries the brightness.
-        let dr = (DOT_R * s).max(0.6);
+        let dr = (DOT_R * s).max(0.45);
         let edge = bar_span - slot * 0.5 + ELEM_R_MAX * s; // outermost element's outer edge
         flank_lo = edge + 0.5 * s;
         flank_hi = hw_c - 0.5 * s;

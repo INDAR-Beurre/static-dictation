@@ -1,0 +1,9 @@
+# Round 4 taste — blunt assessment
+
+1. **Glow overwhelms the quiet waveform.** Tail lift is reported +73–109 luminance vs +17–25 target, with 1.27× median midgap bleed. Fix: lower source gain/kernel and retune against corrected masks (`src/pill/canvas.rs:132-149,613-638`).
+2. **Idle is not quiet.** Hum appears to light the whole center-weighted bar train, not just a restrained center. Fix: confine the idle hum to the posed center cluster (`src/pill/canvas.rs:145-149,450-455`).
+3. **Gaps do not read cleanly.** Gap contrast 1.72 median / 1.17 minimum vs 3.4 / 2.5 target. Fix: reduce bloom in inter-bar gaps without dimming the core (`src/pill/canvas.rs:629-638`).
+4. **Tail color is asymmetric.** Left endpoint B−G +4, below +30; right endpoint passes but overshoots. Fix: tune blue bias on both tails, not only right (`src/pill/canvas.rs:664-678`).
+5. **Motion is almost, not quite, settled.** Period 2.60s is good; ±11% exceeds the ±8–10% band, profile correlation 0.9951 misses 0.998. Fix: slightly reduce breathing amplitude and investigate profile drift (`critique/round3-motion-sheet.md:4-7`).
+
+The idle pill **does read as an object**: the visible dark crease and soft drop shadow keep it from looking like gray plastic; the dark body is close to reference. But the idle waveform is too bright/broad, making the whole surface feel more synthetic than premium. Animation looks fluid at a glance—slow, smooth breathing without obvious popping—and the fluidity audit's ~33 Hz live cadence / ~7 ms render supports that. The measured profile-correlation miss means “fluid” is not yet a complete pixel-audit pass. Round-4 canvas changes are in flight; these observations score committed renders.
