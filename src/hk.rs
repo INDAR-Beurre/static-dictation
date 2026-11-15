@@ -126,6 +126,15 @@ impl Drop for UinputKbd {
     }
 }
 
+/// What the watcher puts back on the virtual keyboard for one event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Emit {
+    Forward,
+    Hide,
+    /// Send a buffered AltGr press first, then this event, so level-3 keys work.
+    FlushAltGr,
+}
+
 /// Keyboard state shared by ALL device watchers: a grab-and-re-emit chain
 /// (keyd → handy clones → compositor) can deliver AltGr on one /dev/input node
 /// and L on another; per-device state would split the combo. Shared also makes
@@ -138,6 +147,13 @@ struct KeyState {
     chord_fired: bool,
     /// True after AltGr+L fired until the matching AltGr release is swallowed.
     chord_consumed: bool,
+    /// An AltGr press seen but NOT yet re-emitted. The chord discards it (so no
+    /// level-3 modifier ever reaches apps); any other key flushes it. Never emit
+    /// a release for a press that was never sent — that leaves AltGr stuck and
+    /// makes the next plain L type "ł".
+    altgr_pending: bool,
+    /// Emission decision for the event just passed to decide().
+    emit: Emit,
     last_toggle: Option<Instant>,
     last_event: Instant, // any tracked stream activity, for the stale-hold safety
 }
@@ -148,14 +164,16 @@ impl KeyState {
             modifier_held: false,
             chord_fired: false,
             chord_consumed: false,
+            altgr_pending: false,
+            emit: Emit::Forward,
             last_toggle: None,
             last_event: Instant::now(),
         }
     }
 }
 
-/// Build a synthetic EV_KEY event. Used to cancel the AltGr press we already
-/// re-emitted, so the chord leaves no modifier state in the focused app.
+/// Build a synthetic EV_KEY event. Used to flush an AltGr press that was held
+/// back while we waited to see whether the next key was L.
 fn synthetic_key(code: u16, value: i32) -> [u8; EVENT_SIZE] {
     let mut b = [0u8; EVENT_SIZE];
     b[16..18].copy_from_slice(&EV_KEY.to_ne_bytes());
@@ -199,15 +217,17 @@ fn is_self_device(fd: std::os::fd::RawFd) -> bool {
     SELF_DEVICE_PREFIXES.iter().any(|p| name.starts_with(p))
 }
 
-/// True if the device's key bitmap carries both keys of the AltGr+L combo.
-fn has_altgr_l(fd: std::os::fd::RawFd) -> bool {
+/// True for a keyboard that can emit L. A remapper clone may not advertise
+/// AltGr, but its L still reaches the compositor and must be grabbed. KEY_A
+/// separates keyboards from mice/touchpads, whose motion events we cannot relay.
+fn has_l_key(fd: std::os::fd::RawFd) -> bool {
     let mut bits = [0u8; 64];
     let n = unsafe { libc::ioctl(fd, EVIOCGBIT_KEY_64, bits.as_mut_ptr()) };
     if n <= 0 {
         return false;
     }
     let has = |code: u16| bits[(code / 8) as usize] & (1 << (code % 8)) != 0;
-    has(KEY_L) && has(KEY_RIGHTALT)
+    has(KEY_L) && has(30) // 30 = KEY_A
 }
 
 impl KeyState {
@@ -221,24 +241,46 @@ impl KeyState {
 
 /// Map one EV_KEY event to an action; updates meta-hold tracking and debounce.
 fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
+    state.emit = Emit::Forward;
     // safety: a missed AltGr keyup (streams out of sync across watchers, or the
     // press is consumed by a remapper like keyd) would leave the hold stuck ON
     // forever, so a later plain L would toggle. If events went quiet for
-    // MODIFIER_IDLE_RESET, the hold and the pending chord consumption are stale.
-    if (state.modifier_held || state.chord_consumed)
+    // MODIFIER_IDLE_RESET, the hold and the buffered press are stale.
+    if (state.modifier_held || state.chord_consumed || state.altgr_pending)
         && state.last_event.elapsed() >= MODIFIER_IDLE_RESET
     {
         state.modifier_held = false;
         state.chord_fired = false;
         state.chord_consumed = false;
+        state.altgr_pending = false;
     }
     state.last_event = Instant::now();
+
+    // Hold the AltGr press back until the next key arrives. L discards it, any
+    // other key flushes it so AltGr+A / AltGr+E still type ą / €.
+    if state.altgr_pending && code != KEY_RIGHTALT {
+        state.altgr_pending = false;
+        if code == KEY_L {
+            state.emit = Emit::Hide;
+        } else {
+            state.emit = Emit::FlushAltGr;
+            state.chord_fired = true; // AltGr has been handed to apps for this hold
+        }
+    }
+
     match value {
         0 => {
             // release: any watcher seeing the AltGr keyup clears the shared hold
             if code == KEY_RIGHTALT {
                 state.modifier_held = false;
                 state.chord_fired = false;
+                if state.chord_consumed || state.altgr_pending {
+                    state.emit = Emit::Hide; // never sent the press ⇒ no release either
+                }
+                state.chord_consumed = false;
+                state.altgr_pending = false;
+            } else if code == KEY_L && l_event_hidden(value, state.modifier_held) {
+                state.emit = Emit::Hide;
             }
             None
         }
@@ -253,18 +295,34 @@ fn decide(state: &mut KeyState, code: u16, value: u8) -> Option<HotkeyEvent> {
                     state.chord_fired = true; // exactly one toggle per AltGr hold
                     state.chord_consumed = true; // hide the matching AltGr release too
                     state.last_toggle = Some(Instant::now());
+                    state.altgr_pending = false;
+                    state.emit = Emit::Hide;
                     Some(HotkeyEvent::Toggle)
+                }
+                KEY_L if state.modifier_held => {
+                    state.emit = Emit::Hide;
+                    None
                 }
                 KEY_RIGHTALT => {
                     state.modifier_held = true;
                     state.chord_fired = false;
                     state.chord_consumed = false;
+                    state.altgr_pending = true;
+                    state.emit = Emit::Hide;
                     None
                 }
                 _ => None,
             }
         }
-        _ => None, // 2 = repeat, ignore
+        _ => {
+            // 2 = repeat: hide L while AltGr is down, and a still-buffered AltGr.
+            if (code == KEY_L && l_event_hidden(value, state.modifier_held))
+                || (code == KEY_RIGHTALT && state.altgr_pending)
+            {
+                state.emit = Emit::Hide;
+            }
+            None
+        }
     }
 }
 
@@ -299,16 +357,19 @@ fn watch_file(
     if is_self_device(file.as_raw_fd()) {
         return None; // never watch our own virtual keyboard (or the test injector)
     }
-    // Grab the device when it can produce the full AltGr+L combo, so L never
+    // Grab every keyboard that can emit L, so neither half of the chord ever
     // reaches the focused window; EBUSY (another grabber) falls back to read-only.
     let mut grabbed = false;
-    if uinput.lock().unwrap().is_some() && has_altgr_l(file.as_raw_fd()) {
+    if uinput.lock().unwrap().is_some() && has_l_key(file.as_raw_fd()) {
         let arg: libc::c_int = 1;
         grabbed = unsafe { libc::ioctl(file.as_raw_fd(), EVIOCGRAB, arg) } == 0;
     }
     if grabbed {
         eprintln!("hk: {path} grabbed (AltGr+L will not type into windows)");
     }
+    // shortcut: a watcher that failed to grab is only a listener — re-emitting
+    // its events would duplicate keys the compositor already received from that
+    // device. Upgrade if a host grabs a keyboard without relaying it onward.
     // the registry is authoritative: never two watchers on one device path
     if !live.lock().unwrap().insert(path.to_string()) {
         return None; // a live watcher already owns this path
@@ -338,37 +399,26 @@ fn watch_file(
                         }
                         // never hold the state lock across eprintln/send: a closed
                         // stderr panics eprintln and would poison the shared mutex
-                        // The chord must do ONE thing: toggle dictation. It must not
-                        // type "l", leave a held AltGr modifier, or trigger any other
-                        // app binding. L press/repeat/release are swallowed; the AltGr
-                        // press we already re-emitted is cancelled with a synthetic
-                        // release, and the real keyup is swallowed too.
-                        // shortcut: cancelling AltGr early means a second level-3 key
-                        // pressed while AltGr is still physically held types its base
-                        // character; upgrade by buffering the AltGr press if needed.
-                        let (hit, hide_altgr_release, hide_l) = {
+                        // The chord must do ONE thing: toggle dictation. The AltGr
+                        // press is buffered, then discarded on L — so apps never see
+                        // a level-3 modifier, no synthetic release is needed, and a
+                        // later plain L cannot turn into "ł".
+                        let (hit, emit) = {
                             let mut st = state.lock().unwrap();
                             let hit = decide(&mut st, code, value as u8);
-                            let hide = code == KEY_RIGHTALT && value == 0 && st.chord_consumed;
-                            if hide {
-                                st.chord_consumed = false;
-                            }
-                            (
-                                hit,
-                                hide,
-                                code == KEY_L && l_event_hidden(value as u8, st.modifier_held),
-                            )
+                            (hit, st.emit)
                         };
-                        let swallow = hide_altgr_release || hide_l;
-                        let cancel_altgr = grabbed && hit == Some(HotkeyEvent::Toggle);
-                        if cancel_altgr {
-                            if let Some(dev) = uinput.lock().unwrap().as_mut() {
-                                dev.emit(&synthetic_key(KEY_RIGHTALT, 0));
-                            }
-                        }
-                        if !swallow {
-                            if let Some(dev) = uinput.lock().unwrap().as_mut() {
-                                dev.emit(&buf);
+                        if grabbed {
+                            let mut guard = uinput.lock().unwrap();
+                            if let Some(dev) = guard.as_mut() {
+                                match emit {
+                                    Emit::Hide => {}
+                                    Emit::FlushAltGr => {
+                                        dev.emit(&synthetic_key(KEY_RIGHTALT, 1));
+                                        dev.emit(&buf);
+                                    }
+                                    Emit::Forward => dev.emit(&buf),
+                                }
                             }
                         }
                         if let Some(h) = hit {
@@ -565,6 +615,48 @@ mod tests {
         assert_eq!(decide(&mut s, KEY_L, 1), Some(HotkeyEvent::Toggle));
         assert!(s.chord_consumed); // the real AltGr keyup must not reach apps
         assert!(s.modifier_held); // held until keyup so no L can leak
+    }
+
+    /// Regression: the chord used to re-emit an AltGr press and then try to
+    /// cancel it with a synthetic release. One unbalanced press left LevelThree
+    /// stuck down, so the next plain L typed "ł".
+    #[test]
+    fn chord_never_sends_altgr_or_l_to_apps() {
+        let mut s = state();
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
+        assert_eq!(s.emit, Emit::Hide); // press buffered, not sent
+        assert!(s.altgr_pending);
+        assert_eq!(decide(&mut s, KEY_L, 1), Some(HotkeyEvent::Toggle));
+        assert_eq!(s.emit, Emit::Hide);
+        assert!(!s.altgr_pending); // buffered press discarded
+        assert_eq!(decide(&mut s, KEY_L, 0), None);
+        assert_eq!(s.emit, Emit::Hide);
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 0), None);
+        assert_eq!(s.emit, Emit::Hide); // no synthetic release needed
+        assert_eq!(decide(&mut s, KEY_L, 1), None);
+        assert_eq!(s.emit, Emit::Forward); // a plain L still types "l"
+    }
+
+    #[test]
+    fn other_level_three_keys_still_work() {
+        const KEY_A: u16 = 30;
+        let mut s = state();
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
+        assert_eq!(decide(&mut s, KEY_A, 1), None); // AltGr+A ⇒ ą
+        assert_eq!(s.emit, Emit::FlushAltGr);
+        assert_eq!(decide(&mut s, KEY_A, 0), None);
+        assert_eq!(s.emit, Emit::Forward);
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 0), None);
+        assert_eq!(s.emit, Emit::Forward); // balanced release
+    }
+
+    #[test]
+    fn bare_altgr_tap_types_nothing() {
+        let mut s = state();
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 1), None);
+        assert_eq!(decide(&mut s, KEY_RIGHTALT, 0), None);
+        assert_eq!(s.emit, Emit::Hide);
+        assert!(!s.altgr_pending);
     }
 
     /// The real watch_file rule: while AltGr is down, EVERY L event is hidden;
