@@ -89,7 +89,8 @@ fn run(dir: PathBuf) {
 
 /// QA-only voiced feed: a reference-like ASYMMETRIC speech envelope with a
 /// slow fluid swell — gradual left ramp, apex right of centre, steep right
-/// falloff. The renderer adds only a gentle asymmetric illumination on top.
+/// falloff. Real speech is broadband, so the pedestal keeps the shoulders
+/// alive; a near-zero flank would double-dim the mask into a narrow needle.
 fn speech_bars(feed: u32) -> [f32; NUM_BARS] {
     let mut bars = [0.0f32; NUM_BARS];
     let n = (NUM_BARS - 1) as f32;
@@ -98,8 +99,8 @@ fn speech_bars(feed: u32) -> [f32; NUM_BARS] {
         let u = i as f32 / n;
         let d = (u - 0.56) / 0.34;
         let sig = if u < 0.56 { 1.4 } else { 4.5 };
-        *b =
-            (0.12 + 0.88 * (-d * d * sig).exp() + swell * (1.0 - d.abs()).max(0.0)).clamp(0.0, 1.0);
+        let envelope = (-d * d * sig).exp();
+        *b = (0.55 + 0.45 * envelope + swell * (1.0 - d.abs()).max(0.0)).clamp(0.0, 1.0);
     }
     bars
 }

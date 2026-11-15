@@ -1,6 +1,6 @@
 //! vecmentor: waveform animation physics for the pill.
 //!
-//! Production rebuild: the pill renders a SYMMETRIC 27-band equalizer driven by
+//! Production rebuild: the pill renders an ASYMMETRIC 27-band equalizer driven by
 //! real spectral energies (`crate::bands::energies`, computed in main.rs per
 //! 30 ms frame). This module owns all motion physics; it is std/core-only,
 //! zero crate imports, no I/O, plain-old-data — trivially unit-testable.
@@ -8,7 +8,7 @@
 //! Contract (FROZEN — other agents code against this):
 //! - `NUM_BARS == 27`, band centers log-spaced over 250..4000 Hz with ratio
 //!   16^(1/26) per step (bar 13 lands exactly on the 1000 Hz voice core;
-//!   mirrored bars i / NUM_BARS-1-i sit at log-symmetric centers).
+//!   edge bars i / NUM_BARS-1-i sit at log-symmetric centers).
 //! - `wave_params() -> WaveParams` — all static tuning constants in one place.
 //! - `Sim::new(params) -> Sim` — fresh simulation state.
 //! - `Sim::push(&mut self, level: f32, bands: &[f32; NUM_BARS], speaking: bool)`
@@ -179,25 +179,16 @@ pub fn wave_params() -> WaveParams {
     }
 }
 
-/// Static silhouette mask, bars 0..26, exactly mirrored (mask[i] == mask[26-i]).
-/// Interpolated from the measured reference envelope (relative to tallest):
-/// left ramp 5 bars [0.06,0.10,0.13,0.14,0.15], dip zone [0.08-0.21] (deepest
-/// at bar 6, climbing back to 0.21 right before the cliff), tall 5-bar cluster
-/// at the exact center [0.61,0.84,1.00,0.84,0.61] (bars 11-15; the reference's
-/// 0.60/0.62 and 0.83/0.84 lopsidedness is a lighting trick, not physics, so
-/// the cluster's edge pairs are averaged to mirrored values), then the mirrored
-/// right fall through the dip back out to the outer dots. Under speech the
-/// spring's outward lag and pair jitter keep the frozen vector alive.
-/// Multiplies the spatial falloff; band energy modulates on top (mask ×
-/// physics, not instead of physics). NOTE: silhouette RATIOS, not absolute
-/// heights — bars still scale with `spatial_falloff`. R8: the reference's
-/// 18-slot envelope `2,3,3,5,5,3,3,3,3,5,8,14,21,17,12,7,5,3` — a short
-/// left crest/dip, a single dominant apex just right of centre, and a steep
-/// right falloff — mapped onto 27 bars. The same ratios pose the idle hum.
+/// Static silhouette mask, bars 0..26. Measured from the reference's 18-slot
+/// envelope `2,3,3,5,5,3,3,3,3,5,8,14,21,17,12,7,5,3`: a short left crest/dip,
+/// a single dominant apex at bar 15, and a steeper right falloff. R9 stretches
+/// the reference's >=8px-tall zone over ~8 bars (was 5), so the luminous mound
+/// reads ~26% of the pill width instead of a narrow needle. The same ratios
+/// pose the idle hum. Band energy modulates on top (mask × physics).
 pub const SHAPE_MASK: [f32; NUM_BARS] = [
-    0.05, 0.06, 0.08, 0.095, 0.143, 0.143, 0.238, 0.238, 0.143, 0.143, 0.143, 0.143, //
-    0.238, 0.381, 0.667, 1.00, 0.810, 0.571, 0.333, 0.238, 0.143, 0.12, 0.11, 0.10, //
-    0.09, 0.08, 0.06,
+    0.03, 0.04, 0.05, 0.06, 0.07, 0.11, 0.16, 0.17, 0.12, 0.10, 0.20, 0.30, //
+    0.42, 0.58, 0.76, 1.00, 0.80, 0.56, 0.38, 0.25, 0.12, 0.08, 0.07, 0.06, //
+    0.05, 0.04, 0.03,
 ];
 
 /// Simulation state. Fixed-size arrays: plain-old-data, Copy, no allocation.
@@ -208,8 +199,7 @@ pub struct Sim {
     bars: [f32; NUM_BARS],
     /// Spring velocity per bar.
     vel: [f32; NUM_BARS],
-    /// Smoothed band envelope per MIRRORED band index (0..NUM_BARS/2+1),
-    /// shared by each mirrored pair before per-bar jitter.
+    /// Smoothed band envelope per bar (0..NUM_BARS), one per spectral band.
     env: [f32; NUM_BARS],
     /// Peak-hold value per band index.
     peak: [f32; NUM_BARS],
