@@ -59,6 +59,14 @@ fn run(dir: PathBuf) {
     );
     let mut sim = Sim::new(crate::pill::vecmentor::wave_params());
     let silence = [0.0f32; NUM_BARS];
+    // The live pill is already showing its idle hum when speech starts; a cold
+    // Sim at zero bars would make the voiced GIF's first frame a fake entrance
+    // pop. Warm the spring into the posed idle handoff before recording.
+    if speech {
+        for _ in 0..40 {
+            sim.push(0.0, &silence, false);
+        }
+    }
     let mut next_push = Instant::now() + FEED;
     let mut next_dump = Instant::now() + DUMP;
     let mut seq: u32 = 0;

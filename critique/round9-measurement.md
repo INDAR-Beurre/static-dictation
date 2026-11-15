@@ -12,6 +12,12 @@
 - `src/dump.rs`: QA-only `speech_bars()` now uses `0.55 + 0.45·envelope` (was
   `0.12 + 0.88·envelope`). Real speech is broadband; a near-zero flank would
   multiply the mask a second time and collapse the mound into a needle.
+- `src/dump.rs`: the voiced dump warms the spring with 40 silent pushes before
+  recording. The live pill is already showing its idle hum when speech starts, so
+  a cold `Sim::new()` at zero bars was a fake entrance pop in the GIF (motion
+  critic's round-9 finding). Onset peak now 34→44 raw px over the first two
+  frames instead of 30→44 from a zero state; the rise is speech attack, not a
+  cold-start artifact. Env-gated, zero product behavior change.
 
 ## Gates
 
@@ -61,7 +67,16 @@ include the drop shadow and are provisional (see `critique/round8-final-scores.m
 - per-column max step **2.0 px** (gate ≤3 px ⇒ PASS)
 - breathing period **2.80 s** (autocorr 0.75, gate ≥1.5 s)
 
-Voiced GIF: 99 frames at 100 ms. Idle GIF: 120 frames at 100 ms.
+Voiced GIF: 99 frames at 100 ms, from a warmed idle handoff. Idle GIF: 120
+frames at 100 ms.
+
+The two color/bloom requests to warm the peak toward pearl-white and neutralize
+the body toward (24,27,30) were **not** actioned: `critique/ref-deep-measure.md`
+established that the reference bar tips never go white (max G 242, R/G 0.72)
+and that the object's edge is a dark crease, not a bright keyline. Those critic
+ROIs include sky/cloud pixels and use different crop scales, so their
+"reference" medians are not comparable to the earlier isolated measurement.
+The dark-on-navy body is a deliberate separation decision for this desktop.
 
 ## Evidence files
 
