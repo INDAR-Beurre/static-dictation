@@ -11,9 +11,9 @@
 //! round-2 complaint).
 //!
 //! Frames are composited at alpha 1.0, grow 1.0 (the posed pill) and the Sim
-//! is fed silence, so an idle run dumps the full idle-pose capsule the
-//! motion sheet measures. Env unset → this module never runs; behavior is
-//! byte-identical to before.
+//! is fed silence (or a synthetic voiced mound with
+//! `STATIC_DICTATION_DUMP_SPEECH=1` for active-frame QA). Env unset →
+//! this module never runs; behavior is byte-identical to before.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -51,8 +51,10 @@ pub fn maybe_spawn() {
 }
 
 fn run(dir: PathBuf) {
+    let speech = std::env::var_os("STATIC_DICTATION_DUMP_SPEECH").is_some();
     eprintln!(
-        "dump: STATIC_DICTATION_DUMP_FRAMES active — idle-pose frames (10/s, scale {SCALE}) → {}",
+        "dump: STATIC_DICTATION_DUMP_FRAMES active — {} frames (10/s, scale {SCALE}) → {}",
+        if speech { "voiced" } else { "idle-pose" },
         dir.display()
     );
     let mut sim = Sim::new(crate::pill::vecmentor::wave_params());
@@ -60,13 +62,16 @@ fn run(dir: PathBuf) {
     let mut next_push = Instant::now() + FEED;
     let mut next_dump = Instant::now() + DUMP;
     let mut seq: u32 = 0;
+    let mut feed: u32 = 0;
     loop {
         let now = Instant::now();
         if now >= next_push {
-            // Silent idle feed: level 0, no bands, not speaking — the Sim
-            // settles into the idle pose and breathes exactly as the live
-            // pill does in silence.
-            sim.push(0.0, &silence, false);
+            if speech {
+                sim.push(0.8, &speech_bars(feed), true);
+            } else {
+                sim.push(0.0, &silence, false);
+            }
+            feed += 1;
             next_push += FEED;
         }
         if now >= next_dump {
@@ -82,21 +87,34 @@ fn run(dir: PathBuf) {
     }
 }
 
+/// QA-only voiced feed: a reference-like mound with a slow fluid swell.
+fn speech_bars(feed: u32) -> [f32; NUM_BARS] {
+    let mut bars = [0.0f32; NUM_BARS];
+    let mid = (NUM_BARS - 1) as f32 / 2.0;
+    let swell = (feed as f32 * 0.05).sin() * 0.10;
+    for (i, b) in bars.iter_mut().enumerate() {
+        let d = (i as f32 - mid) / mid;
+        *b = (0.15 + 0.85 * (-d * d * 9.0).exp() + swell * (1.0 - d.abs())).clamp(0.0, 1.0);
+    }
+    bars
+}
+
 /// Render one pill frame through the REAL renderer and write it as PNG.
 /// Alpha 1.0, grow 1.0: the posed capsule, so idle runs still dump the pose.
 fn write_png(path: &std::path::Path, bars: &[f32], t_secs: f32) {
     let (w, h) = (SURF_W * SCALE, SURF_H * SCALE);
     let mut buf = vec![0u8; (w * h * 4) as usize];
     render_pill(&mut buf, w, h, bars, t_secs, 1.0, 1.0);
-    // BGRA (premultiplied) → straight RGB rows, un-premultiplied against the
-    // near-black desktop (capture_pill.sh's backdrop), for the PNG.
+    // BGRA (premultiplied) → RGB composited over the live host navy, so a
+    // dump frame measures exactly like a compositor screenshot.
+    const HOST: [u32; 3] = [17, 33, 66];
     let mut rows = Vec::with_capacity((w * h * 3) as usize);
     for px in buf.as_chunks::<4>().0 {
         let (b, g, r, a) = (px[0] as u32, px[1] as u32, px[2] as u32, px[3] as u32);
-        let a = a.max(1);
-        rows.push(((r * 255) / a) as u8);
-        rows.push(((g * 255) / a) as u8);
-        rows.push(((b * 255) / a) as u8);
+        let inv = 255 - a;
+        for (c, host) in [(r, HOST[0]), (g, HOST[1]), (b, HOST[2])] {
+            rows.push((c + host * inv / 255).min(255) as u8);
+        }
     }
     let _ = write_png_file(path, w, h, &rows);
 }
