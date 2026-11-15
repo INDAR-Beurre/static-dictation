@@ -94,9 +94,9 @@ fn speech_bars(feed: u32) -> [f32; NUM_BARS] {
     let swell = (feed as f32 * 0.05).sin() * 0.10;
     for (i, b) in bars.iter_mut().enumerate() {
         let d = (i as f32 - mid) / mid;
-        // A single reference-like apex; avoid the near-equal central plateau
-        // that the former broad exponential produced.
-        *b = (0.08 + 0.92 * (-d * d * 3.2).exp() + swell * (1.0 - d.abs())).clamp(0.0, 1.0);
+        // A single reference-like apex; the broad exponential made the
+        // central slots near-equal and read as a five-bar plateau.
+        *b = (0.08 + 0.92 * (-d * d * 9.0).exp() + swell * (1.0 - d.abs())).clamp(0.0, 1.0);
     }
     bars
 }

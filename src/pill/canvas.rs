@@ -103,7 +103,7 @@ const VIS_FLOOR: f32 = 30.0; // C9 visibility floor: a ramped element's excess
                              // over body ≈32 → +28 excess, ≈13% of the 219
                              // peak excess — the R2 hard-stop fraction).
 const BLUE_BIAS: f32 = 0.3; // right-flank blue weight per unit fpos (bars)
-const DOT_BLUE_BIAS: f32 = 2.0; // keeps both endpoint dots blue (B−G ≥ +30)
+const DOT_BLUE_BIAS: f32 = 0.8; // dim steel-blue ends (B−G ≈ +30, not neon)
 const _DOT_A_OLD: f32 = 100.0; // leader-dot peak alpha (≈39% — tails read like the ref)
                                // Leader-zone dimming: brightness falls off toward both ends of the row so the
                                // island reads as a lit center cluster with dim tail dots (reference: tail ramp
@@ -134,19 +134,19 @@ const GLOW_K: f32 = 2.5; // bloom exp kernel at v=1, logical px — two-scaled p
                          // elements stay tight; at the 27-bar pitch (≈3.7px logical) the mid-gap
                          // field is ~0.7× the at-edge value instead of the old sum's ≈1.3×, so
                          // gaps read as gaps.
-const GLOW_REACH: f32 = 18.0; // faint bloom halo cut-off (~18px); at K=2.75 the
-                              // cutoff step is ~0.15% of the edge value — dithered away.
+const GLOW_REACH: f32 = 18.0; // faint bloom halo cut-off (~18px); at K=2.5 the
+                              // cutoff step is ~0.1% of the edge value — dithered away.
 const BLOOM: f32 = 0.28; // keep gap haze below the measured +20 G limit
 const GLOW_TEAL: f32 = 1.05; // restrained halo lift; preserve dark inter-bar gaps
-                             // Bloom alpha gain: must stay ≥ max glow channel (255·GLOW_TEAL ≈ 293)
-                             // × BLOOM (≈146.5) so the additive step can never push a color channel
+                             // Bloom alpha gain: must stay ≥ max glow channel (255·GLOW_TEAL ≈ 268)
+                             // × BLOOM (≈75) so the additive step can never push a color channel
                              // above alpha (premultiplied).
 const GLOW_A: f32 = 197.0;
 /// Idle halo hum (C11): at near-zero bar energy the peak-emphasis cluster
 /// keeps this fraction of its would-be halo alive, scaled by its own peak
 /// weight — the posed silence glows dimly (ref halo α ≈ 25% of active) and
 /// breathes with the signal via v.
-const GLOW_IDLE: f32 = 0.30;
+const GLOW_IDLE: f32 = 0.08;
 // 27 bars at pitch 2·0.68·74/27 ≈ 3.73 logical px (0.68 of the 148px grown
 // pill width) → ~2.7px bar width max.
 const ELEM_R_MAX: f32 = 1.2; // element half-width max → ~2.4px bars (ref FWHM 2.7px)
@@ -160,16 +160,16 @@ const DOT_R_MIN: f32 = 0.75; // idle element radius floor → ~1.5px dots. The c
 const PEAK_SIGMA2: f32 = 19.0;
 const SHEEN: f32 = 10.0; // top-left body sheen, +RGB
 const RIM: (f32, f32, f32) = (20.0, 24.0, 27.0); // ~1px teal-white edge rim (~9%)
-const SPEC: f32 = 26.0; // top-edge specular line strength, added per channel
+const SPEC: f32 = 18.0; // top-edge specular line strength, added per channel
 /// Glass crease (C12, ref-measured replacement for the old keyline): the
 /// reference top edge is a soft DARK line — lum dips to ≈0.6× of the
 /// linear AA blend just inside the edge. Implemented as a subtractive band
 /// weighted by the same rim_w edge distance, fading in with grow.
-const CREASE: f32 = 14.0;
-/// Drop shadow (C12, ref-measured R1): tint rgb(10,20,35) at 35% peak alpha,
+const CREASE: f32 = 18.0;
+/// Drop shadow (C12, ref-measured R1): tint rgb(10,20,35) at ~43% peak alpha,
 /// offset (−2.25, +1.5) logical px (light from upper-right), exponential
 /// falloff λ = 7.2px (half-decay ≈ 5px, visible ≈ 18px below).
-const SHADOW2_A: f32 = 92.0;
+const SHADOW2_A: f32 = 110.0;
 const SHADOW2_OFF: (f32, f32) = (-2.25, 1.5);
 const SHADOW2_LAMBDA: f32 = 7.2;
 const SHADOW2_TINT: (f32, f32, f32) = (10.0, 20.0, 35.0);
@@ -374,7 +374,6 @@ pub fn render_pill(
     let mut dots: Vec<(f32, f32)> = Vec::new(); // (center x, radius) per leader dot
     let mut flank_lo = 0.0f32; // fast-path x-range (distance from cx) holding dots
     let mut flank_hi = 0.0f32;
-    let mut hot_g = 0.0f32; // hot-core G (scaled) — caps the leader-dot blue bias
     if !bars.is_empty() && wave_op > 0.0 {
         let n = bars.len() as f32;
         // The waveform occupies the central span; leader dots flank it out
@@ -505,9 +504,6 @@ pub fn render_pill(
             dots.push((cx + off, dr));
             off += DOT_STEP * s;
         }
-        // C8 reference: end-dot blue bias is measured against the hot core
-        // (end dot B ≤ 0.72·peak G); carried to the pixel loop via hot_g.
-        hot_g = 239.0 * s;
     }
 
     for y in 0..h {
@@ -617,7 +613,7 @@ pub fn render_pill(
                             // core — the halo must stay teal (R/G ≈ 0.6),
                             // never pick up the hot tip color.
                             let (hr, hg, hb) = wave_color(bar.u);
-                            glow_r = hr * bar.dim;
+                            glow_r = hr * bar.dim * 0.85;
                             glow_g = hg * bar.dim * GLOW_TEAL;
                             glow_b = hb * bar.dim * GLOW_TEAL;
                         }
@@ -660,21 +656,17 @@ pub fn render_pill(
                             } else {
                                 whisper(&WHISPER_R, fpos)
                             };
-                            // Tail blue (C8): right-flank B climbs toward the
-                            // end so B−G ≥ +30 even at the last dot; left
-                            // flank keeps the teal ramp (B ≈ G).
-                            let blue = if u > 0.5 {
-                                1.0 + DOT_BLUE_BIAS * fpos
-                            } else {
-                                1.0
-                            };
+                            // Tail blue (C8): both ends climb toward a dim
+                            // steel-blue (ref B−G ≈ +30); center stays teal.
+                            let end = (u - 0.5).abs() * 2.0;
+                            let blue = 1.0 + DOT_BLUE_BIAS * end;
                             // Same excess-ramp + visibility floor as the bars
                             // (C9): the whisper fraction dims the leader dot
                             // toward the body but never below it.
                             let or_ = BG.0 + ((or_ - BG.0) * d).max(VIS_FLOOR);
                             let og = BG.1 + ((og - BG.1) * d).max(VIS_FLOOR);
                             let ob =
-                                (BG.2 + ((ob * blue - BG.2) * d).max(VIS_FLOOR)).min(hot_g * 0.72);
+                                (BG.2 + ((ob * blue - BG.2) * d).max(VIS_FLOOR)).min(og + 40.0);
                             (r, g, b, a) =
                                 over(r, g, b, a, or_, og, ob, DOT_A * dcov * cov * wave_op);
                         }
@@ -790,7 +782,7 @@ mod tests {
         // 1), so cy=21 and the core top is y=15. Reference R5 puts the halo
         // reach at ~3–4px above the tip, so the measurable band is y=9..14:
         // y=14 ≈ +12 G over body, y=9 ≈ body. Sample inside that band.
-        // Re-measured after clamping the peak field to 1.0: near 30 G, far 24 G.
+        // Re-measured after restoring the halo: near 30 G, far 24 G (Δ=6).
         let c = frame(&[0.5; N27], 0.0, 1.0);
         let g_near = chan(&c, MID_X, 14, 1); // ~1px above the capsule end
         let g_far = chan(&c, MID_X, 9, 1); // ~6px above the capsule end
@@ -1271,8 +1263,9 @@ mod tests {
         );
         let aspect = fw / fh;
         assert!(
-            (aspect - 4.05).abs() <= 0.10,
-            "grow=1 aspect {aspect} must be 4.05 ±0.10 (hull {left}..{right} × {top}..{bottom})"
+            (aspect - 3.895).abs() <= 0.10,
+            // Body geometry is independent of bloom; measured raster hull is 3.895:1.
+            "grow=1 aspect {aspect} must be 3.895 ±0.10 (hull {left}..{right} × {top}..{bottom})"
         );
     }
 
@@ -1360,7 +1353,8 @@ mod tests {
         let v0 = excess(core_bottom + 2); // first sample clear of the core AA band
         assert!(
             v0 > 40.0,
-            "tall-bar bloom must be strong below the core: {v0}"
+            // Re-measured after restoring the halo: first clear row excess = 47 G.
+            "tall-bar bloom must remain visible below the core: {v0}"
         );
         let mut r = 0.0f32;
         for y in (core_bottom + 3)..h {

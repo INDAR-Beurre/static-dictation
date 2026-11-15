@@ -165,13 +165,13 @@ pub fn wave_params() -> WaveParams {
         spring_c: 0.56,
         edge_lag: 0.3,
         pair_jitter: 0.25,
-        idle_amp: 0.25,
+        idle_amp: 0.14,
         idle_gate_pushes: 21,
         idle_blend: 0.9,
         idle_phase_step: 0.4,
         idle_rate: 0.075,
-        wobble_amp: 0.05,
-        idle_breathe: 0.09,
+        wobble_amp: 0.01,
+        idle_breathe: 0.07,
         wobble_rate: 0.1,
         idle_pose: 0.45,
     }
@@ -710,7 +710,8 @@ mod tests {
             max_dip = max_dip.max(d);
         }
         assert!(
-            max_dip - min_dip > 0.05 && max_dip < 0.35,
+            max_dip - min_dip > 0.010 && max_dip < 0.35,
+            // Re-measured after reducing residual wave: dip swings 0.0140 over 300 pushes.
             "idle dip must breathe gently: min {min_dip:.3} max {max_dip:.3}"
         );
         // Center-weighted on average: the pose dominates the dim edge dots.
