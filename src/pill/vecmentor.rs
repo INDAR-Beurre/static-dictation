@@ -19,10 +19,12 @@
 //!   values 0.0..1.0 (1.0 = full pill height allowance). No allocation.
 //!
 //! Physics (what makes the equalizer feel alive):
-//! 1. SYMMETRIC MIRROR: bar i is driven by bands[min(i, NUM_BARS-1-i)] —
-//!    center bar = voice core (1 kHz), edges = low freqs. The mirrored pair
-//!    shares the band but gets a small per-bar stiffness jitter so it never
-//!    looks mechanically cloned.
+//! 1. PER-BAR BANDS: bar i is driven directly by `bands[i]` (250 Hz at the
+//!    left edge → 1 kHz voice core at bar 13 → 4 kHz at the right edge).
+//!    The idle handoff keeps mirrored wave phases so silence still poses a
+//!    symmetric hum; voiced frames read as a real, asymmetric spectrum.
+//!    Each bar gets a small per-bar stiffness jitter so it never looks
+//!    mechanically cloned.
 //! 2. PER-BAR ENVELOPE: fast attack (0.8/push — a louder band closes ~80% of
 //!    the gap in a single push), a short peak-hold (~0.3 s) so syllables pop,
 //!    then a gentle release (~0.33 s time constant) for a graceful settle;
@@ -188,11 +190,14 @@ pub fn wave_params() -> WaveParams {
 /// spring's outward lag and pair jitter keep the frozen vector alive.
 /// Multiplies the spatial falloff; band energy modulates on top (mask ×
 /// physics, not instead of physics). NOTE: silhouette RATIOS, not absolute
-/// heights — bars still scale with `spatial_falloff`.
+/// heights — bars still scale with `spatial_falloff`. R8: the reference's
+/// 18-slot envelope `2,3,3,5,5,3,3,3,3,5,8,14,21,17,12,7,5,3` — a short
+/// left crest/dip, a single dominant apex just right of centre, and a steep
+/// right falloff — mapped onto 27 bars. The same ratios pose the idle hum.
 pub const SHAPE_MASK: [f32; NUM_BARS] = [
-    0.06, 0.10, 0.13, 0.14, 0.15, 0.11, 0.08, 0.10, 0.14, 0.18, 0.21, 0.61, //
-    0.84, 1.00, 0.84, 0.61, 0.21, 0.18, 0.14, 0.10, 0.08, 0.11, 0.15, 0.14, //
-    0.13, 0.10, 0.06,
+    0.05, 0.06, 0.08, 0.095, 0.143, 0.143, 0.238, 0.238, 0.143, 0.143, 0.143, 0.143, //
+    0.238, 0.381, 0.667, 1.00, 0.810, 0.571, 0.333, 0.238, 0.143, 0.12, 0.11, 0.10, //
+    0.09, 0.08, 0.06,
 ];
 
 /// Simulation state. Fixed-size arrays: plain-old-data, Copy, no allocation.
@@ -316,12 +321,10 @@ impl Sim {
 
         let center = (NUM_BARS - 1) as f32 * 0.5;
 
-        // 1) Band envelopes (per mirrored band index): fast attack, peak-hold
-        //    ~0.3 s, then slow release. The peak never pins the envelope —
-        //    hold expires and the envelope glides down to the current band.
-        let half = NUM_BARS / 2 + 1; // indices 0..=13 cover all 27 bars mirrored
-        for j in 0..half {
-            let v = band[j.min(NUM_BARS - 1 - j)].max(band[j]);
+        // 1) Band envelopes, ONE per bar: fast attack, peak-hold ~0.3 s,
+        //    then slow release. The peak never pins the envelope — hold
+        //    expires and the envelope glides down to the current band.
+        for (j, &v) in band.iter().enumerate() {
             let env = &mut self.env[j];
             if v > *env {
                 *env += (v - *env) * p.attack;
@@ -341,7 +344,7 @@ impl Sim {
             let spatial = 1.0 - p.spatial_falloff * dist;
 
             let j = core::cmp::min(i, NUM_BARS - 1 - i);
-            let band_env = self.env[j];
+            let band_env = self.env[i];
             // Broadband folds in modestly so loud speech lifts everything.
             let level_term = level * p.level_gain;
             // The spatial envelope scales the WHOLE speech target (band
@@ -415,43 +418,47 @@ mod tests {
     }
 
     #[test]
-    fn one_hot_band_drives_mirror_pair() {
+    fn one_hot_band_drives_its_own_bar() {
         let mut sim = Sim::new(wave_params());
-        // Band 12: cluster edge — loud enough that its mask-scaled target
-        // clearly clears both the silent outer dot and the silent center.
-        let bands = one_hot([0.0; NUM_BARS], 12, 0.9);
+        // Band 15 is the mask apex: a hot band must light that bar alone.
+        let bands = one_hot([0.0; NUM_BARS], 15, 0.9);
         for _ in 0..30 {
             sim.push(0.5, &bands, true);
         }
         let bars = sim.bars();
-        // Bars 12 and 26-12=14 ride band 12; bars 0 and 13 ride other (silent)
-        // bands.
         assert!(
-            bars[12] > bars[0] + 0.2 && bars[12] > bars[13] + 0.2,
-            "band-12 pair must lead: {bars:?}"
+            bars[15] > bars[0] + 0.2 && bars[15] > bars[13] + 0.2,
+            "hot band must lead its own bar: {bars:?}"
         );
         assert!(
-            bars[14] > bars[0] + 0.2 && bars[14] > bars[13] + 0.2,
-            "band-12 pair must lead: {bars:?}"
+            bars[11] < bars[15] - 0.2,
+            "the old mirror pair must not bleed: {bars:?}"
         );
     }
 
     #[test]
-    fn mirrored_pair_close_after_steady_push() {
+    fn envelope_tracks_per_bar_bands() {
         let mut sim = Sim::new(wave_params());
         let mut bands = [0.0f32; NUM_BARS];
         bands[5] = 0.8;
+        bands[21] = 0.8;
         bands[12] = 0.6;
+        bands[14] = 0.6;
         for _ in 0..40 {
             sim.push(1.0, &bands, true);
         }
         let bars = sim.bars();
-        for i in 0..NUM_BARS / 2 {
-            let d = (bars[i] - bars[NUM_BARS - 1 - i]).abs();
+        let p = wave_params();
+        // Voiced bands are per-bar, not mirrored: bar i settles at its own
+        // band (or the broadband floor) times its spatial/mask ratio.
+        for (i, &m) in SHAPE_MASK.iter().enumerate() {
+            let dist = ((i as f32 - 13.0) / 13.0).abs();
+            let spatial = 1.0 - p.spatial_falloff * dist;
+            let expected = bands[i].max(p.level_gain) * spatial * m;
             assert!(
-                d < 0.15,
-                "pair {i}/{} too far apart: {bars:?}",
-                NUM_BARS - 1 - i
+                (bars[i] - expected).abs() < 0.02,
+                "bar {i}: {} vs expected {expected:.4}: {bars:?}",
+                bars[i]
             );
         }
     }
@@ -479,10 +486,12 @@ mod tests {
                 (0.10..=0.14).contains(&overshoot),
                 "target {target}: overshoot {overshoot:.3} outside 10-14%"
             );
-            // Settled: the last 6 pushes all sit within 1% of the target.
+            // Settled: the last 6 pushes sit within 1% of the mask-scaled
+            // center target (SHAPE_MASK[13] = 0.381, spatial = 1.0 there).
+            let expected = target * SHAPE_MASK[13];
             for &b in &tail {
                 assert!(
-                    (b - target).abs() < 0.01,
+                    (b - expected).abs() < 0.01,
                     "target {target}: not settled, tail {tail:?}"
                 );
             }
@@ -511,9 +520,8 @@ mod tests {
                 bars[i]
             );
         }
-        // Cluster dominant, edge dots low, mirrored symmetry. The center peak
-        // (mask 1.0) must rise well above the pre-cluster dip bar 10 (mask
-        // 0.21, gentler 27-bar spatial falloff keeps its neighbor closer).
+        // Reference structure: a short left crest/dip, a single dominant apex
+        // just right of centre (bar 15), a steep right falloff, dim edges.
         assert!(
             bars[13] > bars[10] * 2.0,
             "center cluster must dominate: {bars:?}"
@@ -522,10 +530,18 @@ mod tests {
             bars[0] < 0.05 && bars[26] < 0.05,
             "edge dots must stay low: {bars:?}"
         );
-        for i in 0..NUM_BARS / 2 {
-            let d = (bars[i] - bars[NUM_BARS - 1 - i]).abs();
-            assert!(d < 0.03, "pair {i} asymmetry {d}: {bars:?}");
-        }
+        assert!(
+            bars[15] > bars[14] * 1.15 && bars[15] > bars[16] * 1.15,
+            "single dominant apex: {bars:?}"
+        );
+        assert!(
+            bars[7] > bars[4] && bars[7] > bars[9] && bars[9] < bars[12],
+            "left crest then dip: {bars:?}"
+        );
+        assert!(
+            bars[6] > bars[20] && bars[9] > bars[21],
+            "left ramp runs longer than the right falloff: {bars:?}"
+        );
     }
 
     #[test]
@@ -536,34 +552,33 @@ mod tests {
             sim.push(0.9, &bands, true);
         }
         let bars = sim.bars();
-        // Ramp rises inward from the outermost dot to its crest at bar 4...
+        // Left outer ramp rises to a short crest at bars 6/7, dips, then
+        // climbs through the mound to the single apex at bar 15.
         assert!(
-            bars[0] < bars[1] && bars[1] < bars[3] && bars[3] < bars[4],
-            "ramp must rise inward: {bars:?}"
-        );
-        // ...then falls into the dip (deepest at bar 6, inside the reference's
-        // [0.08-0.21] dip zone), climbs back toward the cluster...
-        assert!(
-            bars[4] > bars[5] && bars[5] > bars[6],
-            "dip must follow the ramp crest: {bars:?}"
+            bars[0] < bars[3] && bars[3] < bars[6],
+            "left outer ramp: {bars:?}"
         );
         assert!(
-            bars[6] < bars[7] && bars[7] < bars[10],
-            "dip must climb back: {bars:?}"
+            bars[6] > bars[5] && bars[6] > bars[9],
+            "left crest then dip: {bars:?}"
         );
-        // ...and the dip sits well below the cluster's first bar (the cliff
-        // into the tall 5-bar center read).
         assert!(
-            bars[6] < bars[11] * 0.5 && bars[20] < bars[15] * 0.5,
-            "dip must sit well below the cluster edge: {bars:?}"
+            bars[9] < bars[12] && bars[12] < bars[14] && bars[14] < bars[15],
+            "mound climbs to the apex: {bars:?}"
         );
-        // Cluster peaks at the exact center; the right side falls back through
-        // the dip and the mirrored ramp into the outer dots.
         for &b in bars {
-            assert!(b <= bars[13] + 1e-4, "center must peak: {bars:?}");
+            assert!(b <= bars[15] + 1e-4, "bar 15 must peak: {bars:?}");
         }
         assert!(
-            bars[15] > bars[16] && bars[16] > bars[17] && bars[17] > bars[18],
+            bars[15] > bars[14] * 1.15 && bars[15] > bars[16] * 1.15,
+            "apex must dominate its shoulders: {bars:?}"
+        );
+        // Steep right falloff into the outer dot row.
+        assert!(
+            bars[16] > bars[17]
+                && bars[17] > bars[18]
+                && bars[18] > bars[19]
+                && bars[19] > bars[20],
             "right side must fall off the cluster: {bars:?}"
         );
         assert!(
@@ -574,18 +589,17 @@ mod tests {
 
     #[test]
     fn pair_jitter_varies_mask_shape_mid_transient() {
-        // The mask sets the steady-state silhouette; pair_jitter must keep
-        // the mirrored pair from filling it in in lockstep (living waveform,
-        // not a frozen vector). Deterministic jitter → deterministic gap.
+        // The asymmetric mask sets the steady-state silhouette; deterministic
+        // jitter must not lock a mirrored mound pair together mid-transient.
         let mut sim = Sim::new(wave_params());
         let bands = [0.5f32; NUM_BARS];
         sim.push(0.9, &bands, true);
         sim.push(0.9, &bands, true);
         let bars = sim.bars();
-        let d = (bars[2] - bars[24]).abs();
+        let d = (bars[10] - bars[16]).abs();
         assert!(
             d > 0.002,
-            "mirrored pair must diverge mid-transient (d={d}): {bars:?}"
+            "mirrored mound pair must diverge mid-transient (d={d}): {bars:?}"
         );
     }
 
@@ -607,9 +621,9 @@ mod tests {
             assert!(b <= 1.0);
         }
         assert!(
-            (0.30..=0.50).contains(&bars[13]),
-            "idle center cluster must sit at ~40% of cap (spec 35-45%): {}",
-            bars[13]
+            (0.30..=0.50).contains(&bars[15]),
+            "idle apex must sit at ~40% of cap (spec 35-45%): {}",
+            bars[15]
         );
         assert!(
             bars[0] < 0.10 && bars[26] < 0.10,
@@ -617,17 +631,17 @@ mod tests {
         );
         // Pose ordering: the dip must sit well below the cluster.
         assert!(
-            bars[6] < bars[13] * 0.5,
+            bars[6] < bars[15] * 0.5,
             "idle dip must sit below the cluster: {bars:?}"
         );
         // Settled: the pose is stable, not chasing noise. Over 15 pushes
-        // (0.5 s) the center moves only with the slow breath (a quarter
+        // (0.5 s) the apex moves only with the slow breath (a quarter
         // cycle of the 2.8 s swell ≈ ±2%), not per-frame.
-        let first = bars[13];
+        let first = bars[15];
         let mut max_drift = 0.0f32;
         for _ in 0..15 {
             sim.push(0.0, &[0.0; NUM_BARS], false);
-            max_drift = max_drift.max((sim.bars()[13] - first).abs());
+            max_drift = max_drift.max((sim.bars()[15] - first).abs());
         }
         assert!(
             max_drift < 0.1,
@@ -651,7 +665,7 @@ mod tests {
         let mut series = Vec::with_capacity(300);
         for _ in 0..300 {
             sim.push(0.0, &[0.0; NUM_BARS], false);
-            let c = sim.bars()[13];
+            let c = sim.bars()[15];
             series.push(c);
             min_center = min_center.min(c);
             max_center = max_center.max(c);
@@ -666,7 +680,7 @@ mod tests {
         );
         assert!(
             (0.32..=0.48).contains(&mean),
-            "mean idle center {mean:.3} outside posed cluster band"
+            "mean idle apex {mean:.3} outside posed cluster band"
         );
         let swing = max_center - min_center;
         assert!(
@@ -758,12 +772,12 @@ mod tests {
         }
         // State must be un-poisoned: normal speech afterwards behaves normally.
         let mut bands = [0.0f32; NUM_BARS];
-        bands[13] = 0.9;
+        bands[15] = 0.9;
         for _ in 0..30 {
             sim.push(1.0, &bands, true);
         }
         assert!(
-            sim.bars()[13] > 0.5,
+            sim.bars()[15] > 0.5,
             "state did not recover: {:?}",
             sim.bars()
         );

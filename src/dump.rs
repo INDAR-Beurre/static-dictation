@@ -87,16 +87,19 @@ fn run(dir: PathBuf) {
     }
 }
 
-/// QA-only voiced feed: a reference-like mound with a slow fluid swell.
+/// QA-only voiced feed: a reference-like ASYMMETRIC speech envelope with a
+/// slow fluid swell — gradual left ramp, apex right of centre, steep right
+/// falloff. The renderer adds only a gentle asymmetric illumination on top.
 fn speech_bars(feed: u32) -> [f32; NUM_BARS] {
     let mut bars = [0.0f32; NUM_BARS];
-    let mid = (NUM_BARS - 1) as f32 / 2.0;
-    let swell = (feed as f32 * 0.05).sin() * 0.10;
+    let n = (NUM_BARS - 1) as f32;
+    let swell = (feed as f32 * 0.05).sin() * 0.06;
     for (i, b) in bars.iter_mut().enumerate() {
-        let d = (i as f32 - mid) / mid;
-        // A single reference-like apex; the broad exponential made the
-        // central slots near-equal and read as a five-bar plateau.
-        *b = (0.08 + 0.92 * (-d * d * 9.0).exp() + swell * (1.0 - d.abs())).clamp(0.0, 1.0);
+        let u = i as f32 / n;
+        let d = (u - 0.56) / 0.34;
+        let sig = if u < 0.56 { 1.4 } else { 4.5 };
+        *b =
+            (0.12 + 0.88 * (-d * d * sig).exp() + swell * (1.0 - d.abs()).max(0.0)).clamp(0.0, 1.0);
     }
     bars
 }

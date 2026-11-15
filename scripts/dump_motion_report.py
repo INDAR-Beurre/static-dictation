@@ -104,6 +104,13 @@ def main():
 
     period, ac_peak = autocorr_period(centers, FPS)
     deltas, corrs = np.array(deltas), np.array(corrs)
+    # Per-column pop detector: the largest single-column height change in any
+    # 100 ms step. Aggregate mean |ΔH| can hide one rim column twinkling.
+    # Skip frame 0→1: the spring's intentional entrance run-in from zero
+    # bars, not a steady-state pop (already gated by the entrance tests).
+    step = np.abs(padded[2:] - padded[1:-1])
+    max_col_step = float(step.max())
+    pop_col = int(np.unravel_index(step.argmax(), step.shape)[1])
 
     lines = [
         "# Round-3 motion sheet (from in-process 100 ms frame dump)",
@@ -118,6 +125,8 @@ def main():
         f"min {corrs.min():.4f} (critic gate ≥ 0.998)",
         f"- center-cluster height series: {centers.min():.1f}–{centers.max():.1f} px "
         f"(±{100 * (centers.max() - centers.min()) / 2 / max(centers.mean(), 1e-9):.1f}% of mean)",
+        f"- per-column max step: {max_col_step:.1f} px at column {pop_col} "
+        f"(gate ≤ 3 px ⇒ {'PASS' if max_col_step <= 3 else 'FAIL'}: no single-column pop)",
         f"- breathing period: "
         + (f"{period:.2f} s (autocorr peak {ac_peak:.2f}, gate ≥ 1.5 s)"
            if period else "not detected (series too short/flat)"),

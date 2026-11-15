@@ -12,8 +12,10 @@
 //! The waveform is ONE element kind: a vertical capsule with fully rounded
 //! caps (r = w/2) that reads as a ~1.1px dim dot at idle and grows into a
 //! ~2px-wide bar; a center-weight envelope (floor 0.75) tapers element
-//! heights toward the edges so silence reads as a centered pyramid of dots,//! and a broad gaussian peak emphasis (gain 1.0, σ² 19 elements²) spreads the
-//! center cluster into a wide lit mound (~26% of the pill width). Peak
+//! heights toward the edges so silence reads as a centered pyramid of dots.
+//! A gentle asymmetric peak emphasis (gain 0.25, σ² 40/14 elements², apex at
+//! 0.55·n) shapes the voiced mound without flattening the shoulders; the
+//! speech envelope itself comes from the audio bands. Peak
 //! brightness follows a steep curve (0.35 + 0.65·v^0.6) and bars whose
 //! peak-emphasized field reaches ~1.0 snap to SOLID hot teal rgb(171,239,238)
 //! — the reference never bleaches white (max G 242, R/G 0.72), so there is no
@@ -154,10 +156,13 @@ const DOT_R_MIN: f32 = 0.75; // idle element radius floor → ~1.5px dots. The c
                              // 0.55, but 0.55 starves END dots of sub-pixel coverage (G-delta ≈10
                              // vs body < the +12 visibility bar); 0.75 keeps the ~1.5px dot while the
                              // env+peak-emphasis ramp carries edge→mid in height.
-/// Center emphasis gaussian σ² in elements² (C4): ref cluster ≈ 26–28% of W
-/// over 27 bars ⇒ σ ≈ 4.35 elements ⇒ σ² ≈ 19. Gain 1.0: the bump adds up to
-/// +1.0 to the field (broad mound), not a thin spike.
-const PEAK_SIGMA2: f32 = 19.0;
+/// Gentle asymmetric illumination (R8): the reference mound is a speech
+/// envelope, not a renderer-imposed symmetric gaussian. Apex right of centre;
+/// broad left σ² = gradual ramp, tight right σ² = steep falloff. Gain 0.25
+/// keeps field < 1 across the shoulders so the clamp cannot make a plateau.
+const PEAK_AT: f32 = 0.55;
+const PEAK_SIGMA2_L: f32 = 40.0;
+const PEAK_SIGMA2_R: f32 = 14.0;
 const SHEEN: f32 = 10.0; // top-left body sheen, +RGB
 const RIM: (f32, f32, f32) = (20.0, 24.0, 27.0); // ~1px teal-white edge rim (~9%)
 const SPEC: f32 = 18.0; // top-edge specular line strength, added per channel
@@ -390,21 +395,19 @@ pub fn render_pill(
                 0.0
             };
             // Idle elements stay visible as small dim dots (never zero height).
-            // Center-weight envelope with a 0.75 floor (C5, ref-measured):
-            // heights taper from the middle to the edges, peak:flank ≈ 7:1
-            // comes from the peak gaussian, not a deep env valley.
+            // Center-weight envelope with a 0.75 floor (C5, ref-measured).
             let env = 0.75 + 0.25 * (PI * ((i as f32 + 0.5) / n)).sin();
-            // Peak emphasis (C4, ref-measured): broad gaussian over the
-            // center (σ² ≈ 19 elements², gain 1.0) lifts a ~26%-of-W mound,
-            // matching the reference's fused lit cluster. Capped to 1.0 so
-            // the hot-snap threshold sees a clean field.
-            let dc = (i as f32 + 0.5) - n * 0.5;
-            let pk = 1.0 + (-(dc * dc) / PEAK_SIGMA2).exp();
-            let raw_field = env * pk;
-            // The peak gaussian is geometry only: clamping the field keeps
-            // every central slot from being pushed to the same max height
-            // (a >1 field flattens the shoulders into a 3-bar plateau).
-            let field = raw_field.min(1.0);
+            // Gentle asymmetric illumination: field stays below 1 across the
+            // shoulders, so .min(1.0) cannot flatten several slots into a
+            // plateau. The voiced shape comes from the audio bands.
+            let dc = (i as f32 + 0.5) - n * PEAK_AT;
+            let sig2 = if dc < 0.0 {
+                PEAK_SIGMA2_L
+            } else {
+                PEAK_SIGMA2_R
+            };
+            let pk = 0.75 + 0.25 * (-(dc * dc) / sig2).exp();
+            let field = (env * pk).min(1.0);
             let half_h = ((v * inner_h * 0.5).max(DOT_R_MIN * s) * field).min(inner_h * 0.5);
             // ONE element kind: width scales with height, 0.55→1.0 logical px —
             // a ~1.1px dot at idle, a ~2px bar when tall; caps fully rounded.
@@ -423,16 +426,11 @@ pub fn render_pill(
             let hr = GRAD_C.0 + (171.0 - GRAD_C.0) * wmix;
             let hg = GRAD_C.1 + (234.0 - GRAD_C.1) * wmix;
             let hb = GRAD_C.2 + (233.0 - GRAD_C.2) * wmix;
-            // Leader-zone dimming: the bars carry the SAME mound envelope
-            // as their height (ref R3: bar core G tracks the cluster mound,
-            // 52–100% of peak, not the 25% tail of the dot line). The
-            // whisper ramp (C9/R2) is the LEADER-DOT curve only (measured on
-            // the 36-dot line), so applying it here would double-dim the
-            // flanks below the reference. `field` is already the height
-            // factor, so colour brightness stays proportional to height.
-            // The soft knee is geometry-only: colour must stay at/below the
-            // palette stop, otherwise a >1 field overdrives the core to white.
-            let dim = field.min(1.0);
+            // Colour follows the AUDIO envelope (`bright`), not the geometric
+            // field: the reference mound is a speech envelope, so a tall bar
+            // is bright because v is high, not because the renderer lifted it.
+            // Keeping dim at 1 also stops a >1 field overdriving a core white.
+            let dim = 1.0;
             // C8 tail blue: the right flank's blue channel is weighted up so
             // the tail reads steel-blue (ref mid-height B−G ≈ +8, end dots
             // ≈ +30), while the left flank stays teal.
@@ -854,34 +852,35 @@ mod tests {
         // neighbors widen the tolerance; the sheen lifts the left end.
         let tol = 30i32;
         // Probed values at the compact pitch (220-wide pill, v=1). Re-anchored
-        // to the hot-teal macro (no white-hot tip per ref-deep-measure): left
-        // end (86,116,122), center (173,241,240), right end (83,107,182).
+        // after R8: colour now follows the audio envelope (`bright`), not the
+        // geometric field, so flat bars land closer to the raw stops — left
+        // (115,153,154), center (170,235,234), right (102,132,225).
         let (r, g, b) = (
             chan(&c, cx_at(0), 21, 2) as i32,
             chan(&c, cx_at(0), 21, 1) as i32,
             chan(&c, cx_at(0), 21, 0) as i32,
         );
-        assert!((r - 86).abs() <= tol, "left dimmed teal R {r} vs ~86");
-        assert!((g - 116).abs() <= tol, "left dimmed teal G {g} vs ~116");
-        assert!((b - 122).abs() <= tol, "left dimmed teal B {b} vs ~122");
-        // Center (i=13, x=110): hot teal peak rgb(173,241,240); ref max G 242.
+        assert!((r - 115).abs() <= tol, "left dimmed teal R {r} vs ~115");
+        assert!((g - 153).abs() <= tol, "left dimmed teal G {g} vs ~153");
+        assert!((b - 154).abs() <= tol, "left dimmed teal B {b} vs ~154");
+        // Center (i=13, x=110): hot teal peak (170,235,234); ref max G 242.
         let (r, g, b) = (
             chan(&c, MID_X, 21, 2) as i32,
             chan(&c, MID_X, 21, 1) as i32,
             chan(&c, MID_X, 21, 0) as i32,
         );
-        assert!((r - 172).abs() <= tol, "center teal R {r} vs 172");
-        assert!((g - 236).abs() <= tol, "center teal G {g} vs 236");
-        assert!((b - 235).abs() <= tol, "center teal B {b} vs 235");
+        assert!((r - 170).abs() <= tol, "center teal R {r} vs 170");
+        assert!((g - 235).abs() <= tol, "center teal G {g} vs 235");
+        assert!((b - 234).abs() <= tol, "center teal B {b} vs 234");
         // Right end (i=26): dimmed blue-steel, lifted by edge bloom.
         let (r, g, b) = (
             chan(&c, cx_at(26), 21, 2) as i32,
             chan(&c, cx_at(26), 21, 1) as i32,
             chan(&c, cx_at(26), 21, 0) as i32,
         );
-        assert!((r - 83).abs() <= tol, "right dimmed blue R {r} vs 83");
-        assert!((g - 107).abs() <= tol, "right dimmed blue G {g} vs 107");
-        assert!((b - 182).abs() <= tol, "right dimmed blue B {b} vs 182");
+        assert!((r - 102).abs() <= tol, "right dimmed blue R {r} vs 102");
+        assert!((g - 132).abs() <= tol, "right dimmed blue G {g} vs 132");
+        assert!((b - 225).abs() <= tol, "right dimmed blue B {b} vs 225");
     }
 
     #[test]

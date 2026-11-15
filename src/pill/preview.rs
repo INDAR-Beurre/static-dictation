@@ -111,7 +111,7 @@ fn story() -> Vec<Story> {
     // slow-release smoothing mirrors the live physics.
     const SPEECH_CENTER: [f32; 36] = [
         // ramp       dip  burst cluster               mirrored fall
-        0.06, 0.10, 0.15, 0.05, 0.60, 0.83, 1.00, 0.84, 0.62, 0.34, 0.18, 0.10, 0.05,
+        0.06, 0.10, 0.15, 0.05, 0.60, 0.83, 1.15, 0.84, 0.62, 0.34, 0.18, 0.10, 0.05,
         // echo syllable      breathing tail (wobbles 0.04..0.12, never zero)
         0.28, 0.55, 0.40, 0.24, 0.12, 0.08, 0.05, 0.09, 0.04, 0.07, 0.11, 0.05, 0.08, 0.12, 0.06,
         0.09, 0.04, 0.06, 0.10, 0.05, 0.08, 0.11, 0.06,
@@ -417,13 +417,13 @@ fn peak_frame_hot_cluster_is_centered() {
     order.sort_unstable_by(|&a, &b| bars[b].total_cmp(&bars[a]));
     let hot = order[0];
     assert!(
-        (12..=14).contains(&hot),
-        "peak hottest bar {hot} not near 13: {bars:?}"
+        (13..=16).contains(&hot),
+        "peak hottest bar {hot} not near the apex 15: {bars:?}"
     );
     for &i in &order[..5] {
         assert!(
-            (11..16).contains(&i),
-            "peak top-5 includes bar {i} outside cluster 11-16: {bars:?}"
+            (10..=18).contains(&i),
+            "peak top-5 includes bar {i} outside the broad mound 10-18: {bars:?}"
         );
     }
 }
