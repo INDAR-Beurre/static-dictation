@@ -1,4 +1,4 @@
-# Round-3 motion sheet (from in-process 100 ms frame dump)
+# Motion sheet (from in-process 100 ms frame dump)
 
 - source: `../../../../../tmp/r9i` — 159 frames used of 159 (frame-0000.png … frame-0158.png), 100 ms/frame, G-threshold 40
 - mean |ΔH| per step: 0.027 px (min 0.000, max 0.475) — slow breathing target ≲1 px/step

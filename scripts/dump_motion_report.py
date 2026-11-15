@@ -113,7 +113,7 @@ def main():
     pop_col = int(np.unravel_index(step.argmax(), step.shape)[1])
 
     lines = [
-        "# Round-3 motion sheet (from in-process 100 ms frame dump)",
+        "# Motion sheet (from in-process 100 ms frame dump)",
         "",
         f"- source: `{os.path.relpath(dumpdir, PROJ)}` — {n} frames used "
         f"of {len(glob.glob(os.path.join(dumpdir, 'frame-*.png')))} "
