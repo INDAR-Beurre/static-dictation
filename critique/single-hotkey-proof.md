@@ -3,8 +3,9 @@
 User asked (m05613, answer "3." in m05646): "make it only the dictation key possible
 and that key is only for dictation no other aczions".
 
-User later reported (m05796): "it still prints "ł"" — pressing the chord still typed
-the Polish letter. See "Root cause of ł" below.
+User later reported (m05796): "it still prints "ł"" and (m05908)
+"łłłłłłłłłłłłłłłłłłłłł" — pressing the chord still typed the Polish letter.
+See "Root cause of ł" and "Real root cause: it was never running" below.
 
 ## What changed
 
@@ -44,6 +45,28 @@ Fix: never emit a release for a press that was never sent. Buffer the press, dis
 it on L, flush it on any other key. `src/hk.rs::chord_never_sends_altgr_or_l_to_apps`,
 `other_level_three_keys_still_work`, `bare_altgr_tap_types_nothing` are regression tests.
 
+## Real root cause: it was never running
+
+`ps` showed no `static-dictation` process and mango's autostart had no entry for
+it. With no EVIOCGRAB, AltGr+L goes straight to the compositor — and this host's
+`de` XKB layout has `lstroke` (ł) on the L key. The user asked for an "always on"
+tool in the very first message; that was never wired up.
+
+- `~/.config/mango/autostart.sh` now starts the release binary once at session
+  start, guarded by `pgrep -f 'target/release/static-dictation'`. This is a
+  machine-level change outside the repo (not committed to git).
+- It is also running **now**: `pgrep -af 'target/release/static-dictation'` shows
+  one process, and the log has both `hk: /dev/input/event9 grabbed` and
+  `hk: /dev/input/event1 grabbed`.
+- `src/hk.rs::listen()` emits one synthetic `AltGr↓ AltGr↑` on the fresh uinput
+  device 300 ms after startup (after libinput has discovered it). This clears a
+  LevelThree modifier left stuck by an earlier crashed/chord-interrupted run, so
+  the first plain L types `l`. Live stream proof: exactly `100,1` then `100,0`,
+  no other keys.
+- Live check on the running instance: an AltGr+L chord emitted **zero** keys to
+  apps and logged one `-> Toggle`; a plain L emitted `38,1 38,0`; AltGr+A emitted
+  `100,1 30,1 30,0 100,0` (level-3 typing still works).
+
 ## Live proof — `bash scripts/verify_single_hotkey.sh /dev/input/event9`
 
 Injects REAL evdev events into the grabbed keyboard node and reads the tool's
@@ -72,8 +95,8 @@ Results (all five regression assertions PASS, script exits 0):
   `whisper-large-v3-turbo` call), headless so no text was typed into a window.
 
 Gates: `cargo fmt --check` ok, `cargo test` 97 passed / 0 failed / 2 ignored,
-`cargo clippy --all-targets -- -D warnings` clean, release binary 3,751,528 bytes
-(3.58 MiB, all Rust, < 50 MB).
+`cargo clippy --all-targets -- -D warnings` clean, release binary 3,756,096 bytes
+(3.58 MiB, all Rust, < 50 MB). Gates re-run after the startup self-heal.
 
 shortcut: a watcher that fails to grab its device is only a listener; if a host
 grabs a keyboard without relaying it onward, keys from that node would be lost.
@@ -81,4 +104,7 @@ Upgrade with a per-node relay decision if that host appears.
 
 Not checked: a real microphone/voice transcription (the injected sample is
 synthetic speech), typing the transcript into a focused Wayland window, and
-keyboards whose AltGr is not keycode 100.
+keyboards whose AltGr is not keycode 100. One test side effect: toggling dictation
+on with the live microphone produced a short room-noise transcript
+("That's it. Bye.") that the tool typed into whatever window had focus —
+ambient noise can still pass the VAD gate.

@@ -505,6 +505,15 @@ pub fn listen(tx: crossbeam_channel::Sender<HotkeyEvent>) -> Result<()> {
     // without /dev/uinput access, in which case grabbing is disabled everywhere
     let uinput: std::sync::Arc<std::sync::Mutex<Option<UinputKbd>>> =
         std::sync::Arc::new(std::sync::Mutex::new(UinputKbd::new()));
+    // A previous run (or a grab taken mid-chord) can leave AltGr held in the
+    // compositor's keyboard group. A press+release on this fresh virtual device
+    // clears LevelThree, so the first plain L types "l" instead of "ł".
+    // The pause lets libinput discover the new device before we write to it.
+    std::thread::sleep(Duration::from_millis(300));
+    if let Some(dev) = uinput.lock().unwrap().as_mut() {
+        dev.emit(&synthetic_key(KEY_RIGHTALT, 1));
+        dev.emit(&synthetic_key(KEY_RIGHTALT, 0));
+    }
     let mut armed = 0usize;
     let mut first_scan = true;
     loop {
