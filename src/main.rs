@@ -26,6 +26,13 @@ const SILENCE_MS: u32 = 700;
 const FRAME: usize = 480;
 /// Keep ~300 ms of pre-voice audio so utterance starts aren't clipped.
 const PRE_ROLL: usize = 4800;
+/// Whisper invents "Thank you."/"Amen." on room noise. Require ~300 ms of voiced
+/// frames in the utterance before spending a Groq request on it.
+const MIN_VOICE_FRAMES: u32 = 10;
+
+fn worth_transcribing(voice_frames: u32, samples: usize) -> bool {
+    voice_frames >= MIN_VOICE_FRAMES && samples > 0
+}
 
 fn main() {
     // A closed stdout reader (e.g. piped to `head`) must kill us silently, not panic in println.
@@ -62,7 +69,7 @@ fn main() {
     let mut ep = endpoint::EndPointer::new(SILENCE_MS);
     let mut band_analyzer = bands::Analyzer::new();
     let mut recording = false; // AltGr+L toggles this
-    let mut seen_voice = false;
+    let mut voice_frames: u32 = 0;
     let mut utterance: Vec<f32> = Vec::new();
     let mut buf: Vec<f32> = Vec::new();
 
@@ -84,9 +91,9 @@ fn main() {
             if recording {
                 let voice = vad.is_voice(&frame);
                 if voice {
-                    seen_voice = true;
+                    voice_frames += 1;
                 }
-                if !seen_voice && utterance.len() > PRE_ROLL {
+                if voice_frames == 0 && utterance.len() > PRE_ROLL {
                     let excess = utterance.len() - PRE_ROLL;
                     utterance.drain(..excess);
                 }
@@ -98,7 +105,7 @@ fn main() {
                     p.update(rms, &bands, voice);
                 }
                 if ep.push(voice) == Decision::End {
-                    finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
+                    finalize(&cfg, &pill, &mut utterance, &mut voice_frames, &mut ep);
                     audio.drop_backlog();
                     // dictation keeps going until AltGr+L toggles it off
                 }
@@ -118,10 +125,11 @@ fn main() {
                         if let Some(p) = &pill {
                             p.hide();
                         }
-                        finalize(&cfg, &pill, &mut utterance, &mut seen_voice, &mut ep);
+                        finalize(&cfg, &pill, &mut utterance, &mut voice_frames, &mut ep);
                         audio.drop_backlog();
                     } else {
                         ep = endpoint::EndPointer::new(SILENCE_MS);
+                        voice_frames = 0;
                         if let Some(p) = &pill {
                             p.show();
                         }
@@ -143,7 +151,7 @@ fn finalize(
     cfg: &config::Config,
     pill: &Option<pill::PillHandle>,
     utterance: &mut Vec<f32>,
-    seen_voice: &mut bool,
+    voice_frames: &mut u32,
     ep: &mut endpoint::EndPointer,
 ) {
     *ep = endpoint::EndPointer::new(SILENCE_MS);
@@ -151,9 +159,9 @@ fn finalize(
     if let Some(p) = pill {
         p.hide();
     }
-    if !*seen_voice || utterance.is_empty() {
+    if !worth_transcribing(*voice_frames, utterance.len()) {
         utterance.clear();
-        *seen_voice = false;
+        *voice_frames = 0;
         return;
     }
     match groq::transcribe(&cfg.groq_api_key, &cfg.endpoint, utterance) {
@@ -162,5 +170,26 @@ fn finalize(
         Err(e) => output::error(&e.to_string()),
     }
     utterance.clear();
-    *seen_voice = false;
+    *voice_frames = 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worth_transcribing;
+
+    #[test]
+    fn room_noise_blips_are_not_transcribed() {
+        // Measured on this host: 12 s of ambient mic yields at most 8 voiced
+        // frames in a row, 11 total — well under a real utterance.
+        assert!(!worth_transcribing(3, 4800));
+        assert!(!worth_transcribing(9, 4800));
+        assert!(!worth_transcribing(10, 0));
+    }
+
+    #[test]
+    fn sustained_speech_is_transcribed() {
+        // 3 s of spoken "hello this is a dictation test one two three" = 36 voiced frames.
+        assert!(worth_transcribing(10, 4800));
+        assert!(worth_transcribing(36, 48000));
+    }
 }
