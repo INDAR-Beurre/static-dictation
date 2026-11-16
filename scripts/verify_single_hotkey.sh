@@ -15,7 +15,7 @@ rm -f /tmp/hkonly.log /tmp/hkonly.stdout /tmp/hkonly-reemit.txt /tmp/hkonly-watc
 python3 scripts/watch_reemit.py 10 /tmp/hkonly-reemit.txt >/tmp/hkonly-watch.log 2>&1 &
 WATCH=$!
 cp target/release/static-dictation /tmp/static-dictation-hk
-env -u WAYLAND_DISPLAY -u DISPLAY NO_TTS=1 timeout 10 /tmp/static-dictation-hk \
+env -u WAYLAND_DISPLAY -u DISPLAY timeout 10 /tmp/static-dictation-hk \
     >/tmp/hkonly.stdout 2>/tmp/hkonly.log &
 BIN=$!
 sleep 2

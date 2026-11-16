@@ -1,10 +1,9 @@
-//! Configuration: reads GROQ_API_KEY (required), NO_TTS, GROQ_BASE_URL (optional).
+//! Configuration: reads GROQ_API_KEY (required), GROQ_BASE_URL (optional).
 //! `load()` returns `Config` directly (not a Result): a missing/blank/whitespace
 //! API key prints one error line and exits(1), per spec.
 
 pub struct Config {
     pub groq_api_key: String,
-    pub no_tts: bool,
     /// Full transcription endpoint, e.g. "https://api.groq.com/openai/v1/audio/transcriptions".
     pub endpoint: String,
 }
@@ -50,15 +49,10 @@ pub fn load() -> Config {
         eprintln!("GROQ_API_KEY not set and no key file at ~/.config/static-dictation/api_key — get one at console.groq.com");
         std::process::exit(1);
     });
-    let no_tts = match std::env::var("NO_TTS") {
-        Ok(v) => !v.is_empty(),
-        Err(_) => false,
-    };
     // shortcut: intermediate binding differs from spec's `base_url` field name; main.rs only needs endpoint
     let base = std::env::var("GROQ_BASE_URL").unwrap_or_else(|_| "https://api.groq.com".into());
     Config {
         groq_api_key,
-        no_tts,
         endpoint: compose_endpoint(&base),
     }
 }

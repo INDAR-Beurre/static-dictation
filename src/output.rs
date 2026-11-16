@@ -1,4 +1,4 @@
-//! output: deliver transcribed text (stdout + direct typing) and spoken feedback.
+//! output: deliver transcribed text (stdout + direct typing). No audio output.
 
 use std::process::{Command, Stdio};
 
@@ -23,8 +23,8 @@ fn typing_target(wayland: bool, x11: bool) -> Choice {
 /// Max chars typed per command: Linux per-arg limit is ~128 KiB (E2BIG); stay well under.
 const MAX_TYPED_CHARS: usize = 100_000;
 
-/// type text into the focused window + stdout + spoken "OK done"
-pub fn deliver(text: &str, no_tts: bool) {
+/// type text into the focused window + stdout
+pub fn deliver(text: &str) {
     println!("{text}");
 
     let typed = clamp_for_typing(flatten_newlines(text));
@@ -42,36 +42,11 @@ pub fn deliver(text: &str, no_tts: bool) {
     if !ok {
         eprintln!("static-dictation: typing unavailable (no wtype/xdotool or no display)");
     }
-
-    if !no_tts {
-        speak("OK done");
-    }
 }
 
-/// eprintln the error + speak an error phrase
-pub fn error(msg: &str, no_tts: bool) {
+/// eprintln the error
+pub fn error(msg: &str) {
     eprintln!("static-dictation: {msg}");
-    if !no_tts {
-        speak("transcription failed");
-    }
-}
-
-/// speak a phrase synchronously (espeak-ng preferred, espeak fallback). Best-effort; never panics.
-pub fn speak(text: &str) {
-    for bin in ["espeak-ng", "espeak"] {
-        // output() runs to completion without a blocking wait; Err means spawn failed.
-        if Command::new(bin)
-            .arg(text)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .is_ok()
-        {
-            return;
-        }
-    }
-    eprintln!("static-dictation: no TTS available (espeak-ng/espeak not found)");
 }
 
 /// Newlines would be typed as Enter keypresses (submitting chat forms mid-dictation); flatten to spaces.

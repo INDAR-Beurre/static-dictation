@@ -7,6 +7,8 @@ mod endpoint;
 mod groq;
 mod hk;
 mod output;
+// Kept only for the offscreen QA frame dump; the Wayland overlay is no longer spawned.
+#[allow(dead_code)]
 mod pill;
 mod vad;
 
@@ -32,7 +34,9 @@ fn main() {
     }
 
     let cfg = config::load();
-    let pill = pill::PillHandle::try_spawn(); // None = headless, tool works without the pill
+    // The separate Wayland overlay sat on top of the desktop island and looked wrong.
+    // Dictation runs headless; the island keeps its clean interface.
+    let pill: Option<pill::PillHandle> = None;
 
     let (hk_tx, hk_rx) = unbounded::<HotkeyEvent>();
     std::thread::spawn(move || {
@@ -153,9 +157,9 @@ fn finalize(
         return;
     }
     match groq::transcribe(&cfg.groq_api_key, &cfg.endpoint, utterance) {
-        Ok(text) if !text.is_empty() => output::deliver(&text, cfg.no_tts),
-        Ok(_) => output::error("empty transcription", cfg.no_tts),
-        Err(e) => output::error(&e.to_string(), cfg.no_tts),
+        Ok(text) if !text.is_empty() => output::deliver(&text),
+        Ok(_) => output::error("empty transcription"),
+        Err(e) => output::error(&e.to_string()),
     }
     utterance.clear();
     *seen_voice = false;
